@@ -3,6 +3,14 @@
 import { useMemo, useState } from "react";
 import CandleChart from "../components/CandleChart";
 
+/**
+ * Deployment-ready API base:
+ * - Local dev fallback: http://localhost:8000
+ * - Vercel prod: set NEXT_PUBLIC_API_BASE_URL to your Render backend URL
+ */
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+
 type PredictResponse = {
   symbol: string;
   timeframe: "daily" | "weekly";
@@ -25,7 +33,14 @@ type PredictResponse = {
 type HistoryResponse = {
   symbol: string;
   timeframe: "daily" | "weekly";
-  candles: { time: string; open: number; high: number; low: number; close: number; volume: number }[];
+  candles: {
+    time: string;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+  }[];
 };
 
 export default function Home() {
@@ -47,12 +62,16 @@ export default function Home() {
 
     try {
       const [predRes, histRes] = await Promise.all([
-        fetch("http://localhost:8000/predict", {
+        fetch(`${API_BASE}/predict`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ symbol: s, timeframe }),
         }),
-        fetch(`http://localhost:8000/history/${encodeURIComponent(s)}?timeframe=${timeframe}&points=200`),
+        fetch(
+          `${API_BASE}/history/${encodeURIComponent(
+            s
+          )}?timeframe=${timeframe}&points=200`
+        ),
       ]);
 
       if (!predRes.ok) throw new Error(`Predict API error: ${predRes.status}`);
@@ -64,7 +83,10 @@ export default function Home() {
       setPred(predJson);
       setHist(histJson);
     } catch (e: any) {
-      setError(e?.message ?? "Network error (is backend running on http://localhost:8000 ?)");
+      setError(
+        e?.message ??
+          `Network error (is backend running on ${API_BASE}/health ?)`
+      );
       setPred(null);
       setHist(null);
     } finally {
@@ -78,12 +100,15 @@ export default function Home() {
   function badgeForPct(p: number) {
     const up = p >= 0;
     return (
-      <span className={`px-2 py-1 rounded-lg text-xs border ${
-        up
-          ? "border-emerald-700 bg-emerald-950/40 text-emerald-200"
-          : "border-red-700 bg-red-950/40 text-red-200"
-      }`}>
-        {up ? "+" : ""}{p.toFixed(2)}%
+      <span
+        className={`px-2 py-1 rounded-lg text-xs border ${
+          up
+            ? "border-emerald-700 bg-emerald-950/40 text-emerald-200"
+            : "border-red-700 bg-red-950/40 text-red-200"
+        }`}
+      >
+        {up ? "+" : ""}
+        {p.toFixed(2)}%
       </span>
     );
   }
@@ -96,8 +121,8 @@ export default function Home() {
             Stock Price Predictor
           </h1>
           <p className="text-sm text-zinc-400 max-w-2xl">
-            Forecasting demo using free market data + baseline ML with market context (SPY/QQQ).
-            Not financial advice.
+            Forecasting demo using free market data + baseline ML with market
+            context (SPY/QQQ). Not financial advice.
           </p>
         </header>
 
@@ -152,7 +177,8 @@ export default function Home() {
                   </span>
                   {pred.cache?.ttl_sec ? (
                     <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-400">
-                      Cached: {pred.cache.hit ? "yes" : "no"} (TTL {pred.cache.ttl_sec}s)
+                      Cached: {pred.cache.hit ? "yes" : "no"} (TTL{" "}
+                      {pred.cache.ttl_sec}s)
                     </span>
                   ) : null}
                 </>
@@ -171,14 +197,19 @@ export default function Home() {
               ) : (
                 <CandleChart
                   candles={candles.map(({ time, open, high, low, close }) => ({
-                    time, open, high, low, close,
+                    time,
+                    open,
+                    high,
+                    low,
+                    close,
                   }))}
                 />
               )}
             </div>
 
             <div className="mt-3 text-xs text-zinc-500">
-              Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last 200 candles
+              Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last 200
+              candles
             </div>
           </div>
 
@@ -194,7 +225,9 @@ export default function Home() {
                 <div>
                   <div className="text-xs text-zinc-500">Symbol</div>
                   <div className="text-lg font-semibold">{pred.symbol}</div>
-                  <div className="text-xs text-zinc-500 mt-1">Timeframe: {pred.timeframe}</div>
+                  <div className="text-xs text-zinc-500 mt-1">
+                    Timeframe: {pred.timeframe}
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -229,7 +262,8 @@ export default function Home() {
                 </div>
 
                 <div className="text-xs text-zinc-500">
-                  Model: RandomForest baseline (with SPY/QQQ context) • Trained on {pred.data_points} candles
+                  Model: RandomForest baseline (with SPY/QQQ context) • Trained on{" "}
+                  {pred.data_points} candles
                 </div>
               </div>
             )}
