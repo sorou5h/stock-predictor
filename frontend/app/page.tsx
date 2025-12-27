@@ -4,10 +4,13 @@ import { useState } from "react";
 
 type PredictResponse = {
   symbol: string;
+  last_close: number;
   prediction: number;
   range_low: number;
   range_high: number;
   confidence: number;
+  data_points: number;
+  source: string;
 };
 
 export default function Home() {
