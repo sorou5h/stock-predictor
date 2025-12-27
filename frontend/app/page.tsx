@@ -1,18 +1,11 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
-} from "recharts";
+import CandleChart from "../components/CandleChart";
 
 type PredictResponse = {
   symbol: string;
+  timeframe: "daily" | "weekly";
   last_close: number;
   prediction: number;
   range_low: number;
@@ -20,36 +13,30 @@ type PredictResponse = {
   confidence: number;
   data_points: number;
   source: string;
+  market: {
+    SPY_last_close: number;
+    QQQ_last_close: number;
+    SPY_ret_1: number; // percent
+    QQQ_ret_1: number; // percent
+  };
+  cache?: { hit: boolean; ttl_sec: number };
 };
 
 type HistoryResponse = {
   symbol: string;
-  points: { date: string; close: number }[];
+  timeframe: "daily" | "weekly";
+  candles: { time: string; open: number; high: number; low: number; close: number; volume: number }[];
 };
 
 export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
+  const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
   const [loading, setLoading] = useState(false);
   const [pred, setPred] = useState<PredictResponse | null>(null);
   const [hist, setHist] = useState<HistoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const chartData = useMemo(() => {
-  if (!hist) return [];
-
-  const data = [...hist.points];
-
-  if (pred) {
-    data.push({
-      date: "Prediction",
-      close: pred.prediction,
-      isPrediction: true,
-    } as any);
-  }
-
-  return data;
-}, [hist, pred]);
-
+  const candles = useMemo(() => hist?.candles ?? [], [hist]);
 
   async function run() {
     const s = symbol.trim().toUpperCase();
@@ -63,9 +50,9 @@ export default function Home() {
         fetch("http://localhost:8000/predict", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbol: s }),
+          body: JSON.stringify({ symbol: s, timeframe }),
         }),
-        fetch(`http://localhost:8000/history/${encodeURIComponent(s)}?days=200`),
+        fetch(`http://localhost:8000/history/${encodeURIComponent(s)}?timeframe=${timeframe}&points=200`),
       ]);
 
       if (!predRes.ok) throw new Error(`Predict API error: ${predRes.status}`);
@@ -77,7 +64,7 @@ export default function Home() {
       setPred(predJson);
       setHist(histJson);
     } catch (e: any) {
-      setError(e?.message ?? "Something went wrong");
+      setError(e?.message ?? "Network error (is backend running on http://localhost:8000 ?)");
       setPred(null);
       setHist(null);
     } finally {
@@ -88,6 +75,19 @@ export default function Home() {
   const changePct =
     pred ? ((pred.prediction - pred.last_close) / pred.last_close) * 100 : null;
 
+  function badgeForPct(p: number) {
+    const up = p >= 0;
+    return (
+      <span className={`px-2 py-1 rounded-lg text-xs border ${
+        up
+          ? "border-emerald-700 bg-emerald-950/40 text-emerald-200"
+          : "border-red-700 bg-red-950/40 text-red-200"
+      }`}>
+        {up ? "+" : ""}{p.toFixed(2)}%
+      </span>
+    );
+  }
+
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="max-w-5xl mx-auto p-6">
@@ -96,14 +96,14 @@ export default function Home() {
             Stock Price Predictor
           </h1>
           <p className="text-sm text-zinc-400 max-w-2xl">
-            Forecasting demo using free daily market data + a baseline ML model.
+            Forecasting demo using free market data + baseline ML with market context (SPY/QQQ).
             Not financial advice.
           </p>
         </header>
 
         <section className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="md:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
-            <div className="flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-3 w-full">
                 <input
                   className="flex-1 rounded-xl bg-zinc-950 border border-zinc-800 px-4 py-3 outline-none focus:ring-2 focus:ring-zinc-600"
@@ -111,6 +111,16 @@ export default function Home() {
                   onChange={(e) => setSymbol(e.target.value)}
                   placeholder="Ticker (e.g., AAPL)"
                 />
+
+                <select
+                  className="rounded-xl bg-zinc-950 border border-zinc-800 px-3 py-3 outline-none focus:ring-2 focus:ring-zinc-600"
+                  value={timeframe}
+                  onChange={(e) => setTimeframe(e.target.value as any)}
+                >
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                </select>
+
                 <button
                   onClick={run}
                   disabled={loading}
@@ -127,55 +137,48 @@ export default function Home() {
               </div>
             )}
 
-            <div className="mt-5 h-[320px] rounded-2xl border border-zinc-800 bg-zinc-950 p-3">
-              {chartData.length === 0 ? (
+            {/* Market context row */}
+            <div className="mt-4 flex flex-wrap gap-2 text-xs text-zinc-300">
+              <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                Market context:
+              </span>
+              {pred ? (
+                <>
+                  <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                    SPY {badgeForPct(pred.market.SPY_ret_1)}
+                  </span>
+                  <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                    QQQ {badgeForPct(pred.market.QQQ_ret_1)}
+                  </span>
+                  {pred.cache?.ttl_sec ? (
+                    <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-400">
+                      Cached: {pred.cache.hit ? "yes" : "no"} (TTL {pred.cache.ttl_sec}s)
+                    </span>
+                  ) : null}
+                </>
+              ) : (
+                <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-500">
+                  run prediction to load
+                </span>
+              )}
+            </div>
+
+            <div className="mt-4 h-[340px] min-w-0 w-full rounded-2xl border border-zinc-800 bg-zinc-950 p-3">
+              {candles.length === 0 ? (
                 <div className="h-full flex items-center justify-center text-sm text-zinc-500">
-                  Run a prediction to load chart
+                  Run a prediction to load candlestick chart
                 </div>
               ) : (
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="date" hide />
-                    <YAxis
-                      domain={["auto", "auto"]}
-                      tick={{ fontSize: 12 }}
-                      width={60}
-                    />
-                    <Tooltip
-                      formatter={(v: any) => [`$${Number(v).toFixed(2)}`, "Close"]}
-                      labelFormatter={(l) => `Date: ${l}`}
-                    />
-                    <Line
-  type="monotone"
-  dataKey="close"
-  dot={(props: any) => {
-    if (props.payload?.isPrediction) {
-      return (
-        <circle
-          cx={props.cx}
-          cy={props.cy}
-          r={6}
-          fill="#22c55e"
-          stroke="white"
-          strokeWidth={2}
-        />
-      );
-    }
-    return null;
-  }}
-  stroke="#3b82f6"
-  strokeWidth={2}
-/>
-
-                  </LineChart>
-                </ResponsiveContainer>
+                <CandleChart
+                  candles={candles.map(({ time, open, high, low, close }) => ({
+                    time, open, high, low, close,
+                  }))}
+                />
               )}
             </div>
 
             <div className="mt-3 text-xs text-zinc-500">
-              Data source: {pred?.source ?? "—"} • Daily closes • Last 200 trading
-              days
+              Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last 200 candles
             </div>
           </div>
 
@@ -191,6 +194,7 @@ export default function Home() {
                 <div>
                   <div className="text-xs text-zinc-500">Symbol</div>
                   <div className="text-lg font-semibold">{pred.symbol}</div>
+                  <div className="text-xs text-zinc-500 mt-1">Timeframe: {pred.timeframe}</div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
@@ -214,7 +218,7 @@ export default function Home() {
                     ${pred.range_low.toFixed(2)} — ${pred.range_high.toFixed(2)}
                   </div>
                   <div className="mt-1 text-xs text-zinc-500">
-                    Confidence: {(pred.confidence * 100).toFixed(0)}%{" "}
+                    Confidence: {(pred.confidence * 100).toFixed(0)}%
                     {changePct !== null && (
                       <span className="ml-2">
                         • Change: {changePct >= 0 ? "+" : ""}
@@ -225,8 +229,7 @@ export default function Home() {
                 </div>
 
                 <div className="text-xs text-zinc-500">
-                  Model: RandomForest baseline • Trained on {pred.data_points}{" "}
-                  data points
+                  Model: RandomForest baseline (with SPY/QQQ context) • Trained on {pred.data_points} candles
                 </div>
               </div>
             )}
