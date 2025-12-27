@@ -11,11 +11,15 @@ app = FastAPI(title="Stock Predictor API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 class PredictRequest(BaseModel):
     symbol: str
@@ -117,3 +121,26 @@ def predict(req: PredictRequest):
         "data_points": int(len(df)),
         "source": "stooq"
     }
+
+@app.get("/history/{symbol}")
+def history(symbol: str, days: int = 200, include_prediction: bool = False):
+    symbol = symbol.upper().strip()
+    if not symbol.isalnum():
+        raise HTTPException(status_code=400, detail="Symbol must be letters/numbers only")
+
+    df = fetch_stooq_daily(symbol)
+    if len(df) < 30:
+        raise HTTPException(status_code=400, detail="Not enough history")
+
+    df = df.tail(days).copy()
+
+    points = [
+        {"date": d.strftime("%Y-%m-%d"), "close": float(c)}
+        for d, c in zip(df["Date"], df["Close"])
+    ]
+
+    return {
+        "symbol": symbol,
+        "points": points
+    }
+
