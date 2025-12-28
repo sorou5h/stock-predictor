@@ -1,7 +1,12 @@
 fastapi
 uvicorn[standard]
+
+# Data & ML
 pandas
 numpy
 requests
 scikit-learn
 scipy
+
+# Optional deep learning (CPU-only, safe on Render)
+torch==2.2.2
