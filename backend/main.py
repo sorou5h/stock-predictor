@@ -436,3 +436,4 @@ def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
     }
     cache_set(_news_cache, cache_key, payload)
     return payload
+
