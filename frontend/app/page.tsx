@@ -30,6 +30,24 @@ type PredictResponse = {
   cache?: { hit: boolean; ttl_sec: number };
 };
 
+type ForecastItem = {
+  horizon: number;
+  prediction: number;
+  range_low: number;
+  range_high: number;
+  change_pct: number;
+  confidence: number;
+};
+
+type ForecastResponse = {
+  symbol: string;
+  timeframe: "daily" | "weekly";
+  last_close: number;
+  as_of: string;
+  horizons: ForecastItem[];
+  source: string;
+};
+
 type HistoryResponse = {
   symbol: string;
   timeframe: "daily" | "weekly";
@@ -97,6 +115,7 @@ export default function Home() {
   const [loadingMsg, setLoadingMsg] = useState<string | null>(null);
   const [pred, setPred] = useState<PredictResponse | null>(null);
   const [hist, setHist] = useState<HistoryResponse | null>(null);
+  const [forecast, setForecast] = useState<ForecastResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
@@ -234,7 +253,7 @@ export default function Home() {
     }, 1200);
 
     try {
-      const [predRes, histRes] = await Promise.all([
+      const [predRes, histRes, fcRes] = await Promise.all([
         fetch(`${API_BASE}/predict`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -245,16 +264,24 @@ export default function Home() {
             s
           )}?timeframe=${timeframe}&points=200`
         ),
+        fetch(`${API_BASE}/forecast`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: s, timeframe }),
+        }),
       ]);
 
       if (!predRes.ok) throw new Error(`Predict API error: ${predRes.status}`);
       if (!histRes.ok) throw new Error(`History API error: ${histRes.status}`);
+      if (!fcRes.ok) throw new Error(`Forecast API error: ${fcRes.status}`);
 
       const predJson = (await predRes.json()) as PredictResponse;
       const histJson = (await histRes.json()) as HistoryResponse;
+      const fcJson = (await fcRes.json()) as ForecastResponse;
 
       setPred(predJson);
       setHist(histJson);
+      setForecast(fcJson);
     } catch (e: any) {
       setError(
         e?.message ??
@@ -262,6 +289,7 @@ export default function Home() {
       );
       setPred(null);
       setHist(null);
+      setForecast(null);
     } finally {
       // Keep the message visible briefly so it doesn't flash too fast
       const elapsed = Date.now() - startedAt;
@@ -620,6 +648,42 @@ export default function Home() {
                       ${pred.prediction.toFixed(2)}
                     </div>
                   </div>
+                </div>
+
+                {/* Multi-horizon forecast */}
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="text-xs text-zinc-500">Multi-horizon forecast</div>
+                  {!forecast || forecast.horizons.length === 0 ? (
+                    <div className="mt-2 text-sm text-zinc-500">Forecast not available.</div>
+                  ) : (
+                    <div className="mt-3 grid grid-cols-1 gap-2">
+                      {forecast.horizons.map((it) => {
+                        const label =
+                          timeframe === "daily"
+                            ? `${it.horizon}D`
+                            : `${it.horizon}W`;
+                        return (
+                          <div
+                            key={it.horizon}
+                            className="flex items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-900/20 px-3 py-2"
+                          >
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs text-zinc-400 w-10">{label}</span>
+                              <span className="text-sm font-semibold text-zinc-100">
+                                ${fmtMoney(it.prediction)}
+                              </span>
+                              <span className="text-xs text-zinc-500">
+                                (${fmtMoney(it.range_low)}–${fmtMoney(it.range_high)})
+                              </span>
+                            </div>
+                            <span className={it.change_pct >= 0 ? "text-xs text-emerald-200" : "text-xs text-red-200"}>
+                              {it.change_pct >= 0 ? "+" : ""}{it.change_pct.toFixed(2)}%
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
 
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
