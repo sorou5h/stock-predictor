@@ -64,6 +64,7 @@ export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
   const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
   const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState<string | null>(null);
   const [pred, setPred] = useState<PredictResponse | null>(null);
   const [hist, setHist] = useState<HistoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -129,6 +130,26 @@ export default function Home() {
     setLoading(true);
     setError(null);
 
+    const startedAt = Date.now();
+
+    // Friendly rotating status messages
+    const steps = [
+      "Waking up the AI server…",
+      "Downloading the latest market data…",
+      "Analyzing past prices…",
+      "Comparing against SPY & QQQ…",
+      "Training the model (cached for speed)…",
+      "Predicting the future outcome…",
+      "Rendering chart & results…",
+    ];
+
+    setLoadingMsg(steps[0]);
+    let i = 0;
+    const timer = setInterval(() => {
+      i = (i + 1) % steps.length;
+      setLoadingMsg(steps[i]);
+    }, 1200);
+
     try {
       const [predRes, histRes] = await Promise.all([
         fetch(`${API_BASE}/predict`, {
@@ -159,7 +180,16 @@ export default function Home() {
       setPred(null);
       setHist(null);
     } finally {
+      // Keep the message visible briefly so it doesn't flash too fast
+      const elapsed = Date.now() - startedAt;
+      const minShowMs = 900;
+      if (elapsed < minShowMs) {
+        await new Promise((r) => setTimeout(r, minShowMs - elapsed));
+      }
+
+      clearInterval(timer);
       setLoading(false);
+      setLoadingMsg(null);
     }
   }
 
@@ -223,6 +253,11 @@ export default function Home() {
                   {loading ? "Running..." : "Predict"}
                 </button>
               </div>
+              {loading && (
+                <div className="mt-3 text-sm text-zinc-400">
+                  {loadingMsg ?? "Working…"}
+                </div>
+              )}
             </div>
 
             {error && (
