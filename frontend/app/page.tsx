@@ -392,7 +392,11 @@ export default function Home() {
                   )}
 
                   <div className="mt-1 text-[11px] text-zinc-500">
-                    {symbolsLoading ? "Loading symbols…" : `Pick from S&P 500 or type any ticker manually.`}
+                    {symbolsLoading
+                      ? "Loading symbols…"
+                      : symbolsError
+                        ? "Symbols failed to load — you can still type any ticker manually."
+                        : `Loaded ${symbols.length} S&P 500 symbols. Search by name or ticker.`}
                   </div>
                 </div>
 
