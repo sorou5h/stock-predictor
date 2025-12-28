@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Any
 import pandas as pd
 import numpy as np
 import requests
@@ -37,6 +38,10 @@ _hist_cache: dict[str, tuple[float, dict]] = {}
 # News cache
 NEWS_CACHE_TTL_SEC = 10 * 60  # 10 minutes
 _news_cache: dict[str, tuple[float, dict]] = {}
+
+# Symbols cache (S&P 500 list)
+SYMBOLS_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
+_symbols_cache: dict[str, tuple[float, dict]] = {}
 
 
 class PredictRequest(BaseModel):
@@ -437,3 +442,84 @@ def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
     cache_set(_news_cache, cache_key, payload)
     return payload
 
+ 
+# ----------------------------
+# Symbols: S&P 500 (free source)
+# ----------------------------
+
+def _fetch_sp500_from_wikipedia() -> list[dict[str, Any]]:
+    """Fetch S&P 500 constituents from Wikipedia (free)."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+    tables = pd.read_html(url)
+    if not tables:
+        raise RuntimeError("No tables found on Wikipedia page")
+
+    df = tables[0]
+
+    cols = {str(c).lower(): c for c in df.columns}
+    sym_col = cols.get("symbol")
+    name_col = cols.get("security")
+    sector_col = cols.get("gics sector")
+
+    if not sym_col or not name_col:
+        raise RuntimeError("Unexpected table schema for S&P 500 page")
+
+    out: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        sym = str(row[sym_col]).strip().upper()
+        sym_alt = sym.replace(".", "-")  # BRK.B -> BRK-B (often needed)
+
+        name = str(row[name_col]).strip()
+        sector = str(row[sector_col]).strip() if sector_col else ""
+
+        out.append({
+            "symbol": sym,
+            "symbol_alt": sym_alt if sym_alt != sym else None,
+            "name": name,
+            "sector": sector,
+        })
+
+    # Deduplicate by symbol
+    seen = set()
+    dedup = []
+    for it in out:
+        if it["symbol"] in seen:
+            continue
+        seen.add(it["symbol"])
+        dedup.append(it)
+
+    return dedup
+
+
+@app.get("/symbols/sp500")
+def symbols_sp500(limit: int = 600):
+    """Return S&P 500 constituents for dropdown search. Cached for 24 hours."""
+    cache_key = "sp500"
+    cached = cache_get(_symbols_cache, cache_key, SYMBOLS_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
+    try:
+        items = _fetch_sp500_from_wikipedia()
+        source = "wikipedia"
+    except Exception:
+        # Fallback if Wikipedia is temporarily unavailable
+        items = [
+            {"symbol": "AAPL", "symbol_alt": None, "name": "Apple Inc.", "sector": "Information Technology"},
+            {"symbol": "MSFT", "symbol_alt": None, "name": "Microsoft", "sector": "Information Technology"},
+            {"symbol": "AMZN", "symbol_alt": None, "name": "Amazon", "sector": "Consumer Discretionary"},
+            {"symbol": "NVDA", "symbol_alt": None, "name": "NVIDIA", "sector": "Information Technology"},
+            {"symbol": "GOOGL", "symbol_alt": None, "name": "Alphabet (Class A)", "sector": "Communication Services"},
+        ]
+        source = "fallback"
+
+    limit = int(max(1, min(limit, 2000)))
+    payload = {
+        "items": items[:limit],
+        "source": source,
+        "cache_ttl_sec": SYMBOLS_CACHE_TTL_SEC,
+        "count": min(len(items), limit),
+    }
+    cache_set(_symbols_cache, cache_key, payload)
+    return payload
