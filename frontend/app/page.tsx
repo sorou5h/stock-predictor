@@ -295,6 +295,53 @@ export default function Home() {
     );
   }
 
+  function toneBadge(label: string, tone: "good" | "bad" | "neutral") {
+    const cls =
+      tone === "good"
+        ? "border-emerald-700 bg-emerald-950/40 text-emerald-200"
+        : tone === "bad"
+          ? "border-red-700 bg-red-950/40 text-red-200"
+          : "border-zinc-700 bg-zinc-950 text-zinc-200";
+
+    return (
+      <span className={`px-2 py-1 rounded-lg text-xs border ${cls}`}>{label}</span>
+    );
+  }
+
+  function pctTone(p: number) {
+    if (p > 0.15) return "good" as const;
+    if (p < -0.15) return "bad" as const;
+    return "neutral" as const;
+  }
+
+  function confidenceLabel(c: number) {
+    const x = clamp01(c);
+    if (x >= 0.75) return { label: "High", tone: "good" as const };
+    if (x >= 0.5) return { label: "Medium", tone: "neutral" as const };
+    return { label: "Low", tone: "bad" as const };
+  }
+
+  function expectedMovePct(rangeLow: number, rangeHigh: number, lastClose: number) {
+    const w = Math.max(0, rangeHigh - rangeLow);
+    if (!lastClose || lastClose === 0) return 0;
+    return (w / lastClose) * 100;
+  }
+
+  function riskLabelFromMove(movePct: number) {
+    if (movePct >= 6) return { label: "High", tone: "bad" as const };
+    if (movePct >= 3) return { label: "Medium", tone: "neutral" as const };
+    return { label: "Low", tone: "good" as const };
+  }
+
+  function marketBias(market: PredictResponse["market"]) {
+    const spy = market?.SPY_ret_1 ?? 0;
+    const qqq = market?.QQQ_ret_1 ?? 0;
+    const avg = (spy + qqq) / 2;
+    if (avg > 0.15) return { label: "Risk-on", detail: "SPY/QQQ up", tone: "good" as const };
+    if (avg < -0.15) return { label: "Risk-off", detail: "SPY/QQQ down", tone: "bad" as const };
+    return { label: "Mixed", detail: "SPY/QQQ flat", tone: "neutral" as const };
+  }
+
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="max-w-5xl mx-auto p-6">
@@ -589,6 +636,74 @@ export default function Home() {
                       </span>
                     )}
                   </div>
+                </div>
+
+                {/* Prediction Breakdown */}
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-xs text-zinc-500">Prediction Breakdown</div>
+                    {(() => {
+                      const c = confidenceLabel(pred.confidence);
+                      return toneBadge(`${c.label} confidence`, c.tone);
+                    })()}
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    {(() => {
+                      const dir = pred.prediction - pred.last_close;
+                      const pct = (dir / pred.last_close) * 100;
+                      const tone = pctTone(pct);
+                      const label = pct >= 0 ? `Bullish (${pct.toFixed(2)}%)` : `Bearish (${pct.toFixed(2)}%)`;
+                      return (
+                        <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                          <div className="text-[11px] text-zinc-500">Direction</div>
+                          <div className="mt-1">{toneBadge(label, tone)}</div>
+                        </div>
+                      );
+                    })()}
+
+                    {(() => {
+                      const bias = marketBias(pred.market);
+                      return (
+                        <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                          <div className="text-[11px] text-zinc-500">Market mood</div>
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
+                            {toneBadge(bias.label, bias.tone)}
+                            <span className="text-[11px] text-zinc-500">{bias.detail}</span>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    {(() => {
+                      const mv = expectedMovePct(pred.range_low, pred.range_high, pred.last_close);
+                      const r = riskLabelFromMove(mv);
+                      return (
+                        <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                          <div className="text-[11px] text-zinc-500">Expected move</div>
+                          <div className="mt-1 flex flex-wrap items-center gap-2">
+                            {toneBadge(`~${mv.toFixed(1)}%`, r.tone)}
+                            <span className="text-[11px] text-zinc-500">Range-based</span>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Key inputs</div>
+                      <div className="mt-1 flex flex-wrap gap-2 text-xs">
+                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">Price history</span>
+                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">Volume</span>
+                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">SPY</span>
+                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">QQQ</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <p className="mt-3 text-[11px] text-zinc-500 leading-relaxed">
+                    This breakdown is a simple explanation based on model inputs (market context + recent price behavior). It helps interpret the output,
+                    but it does not prove causation.
+                  </p>
                 </div>
 
                 <div className="text-xs text-zinc-500">
