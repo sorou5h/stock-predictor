@@ -9,6 +9,11 @@ from sklearn.ensemble import RandomForestRegressor
 from fastapi.middleware.cors import CORSMiddleware
 import time
 
+# News endpoint imports
+import os
+import hashlib
+from datetime import datetime
+
 
 app = FastAPI(title="Stock Predictor API")
 
@@ -28,6 +33,10 @@ PRED_CACHE_TTL_SEC = 15 * 60  # 15 minutes
 HIST_CACHE_TTL_SEC = 15 * 60
 _pred_cache: dict[str, tuple[float, dict]] = {}
 _hist_cache: dict[str, tuple[float, dict]] = {}
+
+# News cache
+NEWS_CACHE_TTL_SEC = 10 * 60  # 10 minutes
+_news_cache: dict[str, tuple[float, dict]] = {}
 
 
 class PredictRequest(BaseModel):
@@ -284,4 +293,146 @@ def predict(req: PredictRequest):
     }
 
     cache_set(_pred_cache, cache_key, payload)
+    return payload
+
+
+# ----------------------------
+# News helpers
+# ----------------------------
+
+def _mk_id(url: str, title: str) -> str:
+    raw = (url or "") + "|" + (title or "")
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _fmt_time(s: str | None) -> str:
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%b %d, %Y %H:%M UTC")
+    except Exception:
+        return s
+
+
+@app.get("/news")
+def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
+    """
+    Market / ticker news endpoint.
+
+    Placeholder mode:
+      - If MARKET_AUX_TOKEN is not set, returns placeholder items.
+
+    Live mode (Marketaux):
+      - US-only, English news.
+      - If mode=ticker, requires `symbol`.
+    """
+    mode = (mode or "market").strip().lower()
+    if mode not in ("market", "ticker"):
+        raise HTTPException(status_code=400, detail="mode must be market or ticker")
+
+    sym = (symbol or "").upper().strip()
+    if mode == "ticker" and (not sym or not sym.isalnum()):
+        raise HTTPException(status_code=400, detail="symbol is required for ticker mode (e.g., AAPL)")
+
+    limit = int(max(1, min(limit, 10)))
+    cache_key = f"{mode}:{sym}:{limit}"
+
+    cached = cache_get(_news_cache, cache_key, NEWS_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
+    token = os.getenv("MARKET_AUX_TOKEN")
+
+    # ---------- Placeholder ----------
+    if not token:
+        if mode == "market":
+            items = [
+                {
+                    "id": "m1",
+                    "title": "Placeholder: Stocks mixed as traders weigh rates and earnings",
+                    "source": "Placeholder News",
+                    "time": "Today",
+                    "summary": "Set MARKET_AUX_TOKEN to enable live US market headlines.",
+                    "url": None,
+                },
+                {
+                    "id": "m2",
+                    "title": "Placeholder: Volatility elevated ahead of key macro prints",
+                    "source": "Placeholder News",
+                    "time": "Today",
+                    "summary": "Once enabled, this feed will return real clickable articles.",
+                    "url": None,
+                },
+            ]
+        else:
+            items = [
+                {
+                    "id": "t1",
+                    "title": f"Placeholder: {sym} — latest company headlines",
+                    "source": "Placeholder News",
+                    "time": "Today",
+                    "summary": "Set MARKET_AUX_TOKEN to enable live ticker-specific headlines.",
+                    "url": None,
+                }
+            ]
+
+        payload = {
+            "mode": mode,
+            "symbol": sym if sym else None,
+            "items": items,
+            "source": "placeholder",
+        }
+        cache_set(_news_cache, cache_key, payload)
+        return payload
+
+    # ---------- Live Marketaux ----------
+    url = "https://api.marketaux.com/v1/news/all"
+    params = {
+        "api_token": token,
+        "countries": "us",
+        "language": "en",
+        "filter_entities": "true",
+        "limit": str(limit),
+    }
+    if mode == "ticker":
+        params["symbols"] = sym
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"News provider error: {r.status_code}")
+        j = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"News provider request failed: {e}")
+
+    data = j.get("data") or []
+    items = []
+    for a in data:
+        title = a.get("title") or ""
+        src = a.get("source") or "Marketaux"
+        published = a.get("published_at") or ""
+        desc = a.get("description") or a.get("snippet") or a.get("summary") or ""
+        link = a.get("url")
+
+        items.append(
+            {
+                "id": _mk_id(link or "", title),
+                "title": title,
+                "source": src,
+                "time": _fmt_time(published),
+                "summary": (desc[:220] + "…") if len(desc) > 220 else desc,
+                "url": link,
+            }
+        )
+
+    payload = {
+        "mode": mode,
+        "symbol": sym if sym else None,
+        "items": items,
+        "source": "marketaux",
+    }
+    cache_set(_news_cache, cache_key, payload)
     return payload
