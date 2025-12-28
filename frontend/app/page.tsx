@@ -140,8 +140,19 @@ function fmtMoney(n: number) {
   });
 }
 
+
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
+}
+
+function pct(a: number, b: number) {
+  if (!b) return 0;
+  return ((a - b) / b) * 100;
+}
+
+function safeNum(x: any, fallback = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 export default function Home() {
@@ -188,6 +199,92 @@ export default function Home() {
   const [comboOpen, setComboOpen] = useState(false);
 
   const candles = useMemo(() => hist?.candles ?? [], [hist]);
+
+  const insights = useMemo(() => {
+    const cs = candles ?? [];
+    if (cs.length < 5) {
+      return {
+        ok: false,
+        trendLabel: "—",
+        trendTone: "neutral" as const,
+        volPct: 0,
+        hi: null as number | null,
+        lo: null as number | null,
+        volNow: null as number | null,
+        volAvg: null as number | null,
+        volTone: "neutral" as const,
+        lookback: 0,
+      };
+    }
+
+    const last = cs[cs.length - 1];
+    const lastClose = safeNum(last.close);
+
+    // Trend: compare last close vs close N candles ago
+    const N = Math.min(20, cs.length - 1);
+    const prevClose = safeNum(cs[cs.length - 1 - N].close, lastClose);
+    const trendPct = pct(lastClose, prevClose);
+
+    const trendTone =
+      trendPct > 0.25
+        ? ("good" as const)
+        : trendPct < -0.25
+        ? ("bad" as const)
+        : ("neutral" as const);
+
+    const trendLabel =
+      trendPct > 0.25
+        ? `Up (${trendPct.toFixed(2)}%)`
+        : trendPct < -0.25
+        ? `Down (${trendPct.toFixed(2)}%)`
+        : `Flat (${trendPct.toFixed(2)}%)`;
+
+    // Volatility: avg absolute % move over last N candles
+    const slice = cs.slice(-N - 1);
+    let sumAbs = 0;
+    let count = 0;
+    for (let i = 1; i < slice.length; i++) {
+      const c = safeNum(slice[i].close);
+      const p = safeNum(slice[i - 1].close);
+      if (p) {
+        sumAbs += Math.abs(((c - p) / p) * 100);
+        count += 1;
+      }
+    }
+    const volPct = count ? sumAbs / count : 0;
+
+    // High/Low over last 52 candles (or available)
+    const lookback = Math.min(52, cs.length);
+    const lb = cs.slice(-lookback);
+    const hi = Math.max(...lb.map((x) => safeNum(x.high)));
+    const lo = Math.min(...lb.map((x) => safeNum(x.low)));
+
+    // Volume now vs avg
+    const volNow = safeNum(last.volume, 0);
+    const volAvg =
+      lb.reduce((acc, x) => acc + safeNum(x.volume, 0), 0) /
+      Math.max(1, lb.length);
+
+    const volTone =
+      volNow > volAvg * 1.15
+        ? ("good" as const)
+        : volNow < volAvg * 0.85
+        ? ("bad" as const)
+        : ("neutral" as const);
+
+    return {
+      ok: true,
+      trendLabel,
+      trendTone,
+      volPct,
+      hi,
+      lo,
+      volNow,
+      volAvg,
+      volTone,
+      lookback,
+    };
+  }, [candles]);
 
   // -------- API helpers (stock/crypto routing) --------
   function apiPath(p: string) {
@@ -1060,9 +1157,87 @@ export default function Home() {
               )}
             </div>
 
-            <div className="mt-3 text-xs text-zinc-500">
-              Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last 200
-              candles
+            <div className="mt-3 space-y-3">
+              {/* Insights strip */}
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="text-[11px] text-zinc-500">Trend (last ~20)</div>
+                  <div className="mt-1 text-sm">
+                    {insights.ok ? (
+                      <span
+                        className={
+                          insights.trendTone === "good"
+                            ? "text-emerald-200"
+                            : insights.trendTone === "bad"
+                            ? "text-red-200"
+                            : "text-zinc-200"
+                        }
+                      >
+                        {insights.trendLabel}
+                      </span>
+                    ) : (
+                      <span className="text-zinc-500">—</span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="text-[11px] text-zinc-500">Volatility (avg move)</div>
+                  <div className="mt-1 text-sm text-zinc-200">
+                    {insights.ok ? `~${insights.volPct.toFixed(2)}%` : "—"}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="text-[11px] text-zinc-500">
+                    High (last {insights.ok ? insights.lookback : "—"})
+                  </div>
+                  <div className="mt-1 text-sm text-zinc-200">
+                    {insights.ok && insights.hi !== null
+                      ? `$${fmtMoney(insights.hi)}`
+                      : "—"}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="text-[11px] text-zinc-500">
+                    Low (last {insights.ok ? insights.lookback : "—"})
+                  </div>
+                  <div className="mt-1 text-sm text-zinc-200">
+                    {insights.ok && insights.lo !== null
+                      ? `$${fmtMoney(insights.lo)}`
+                      : "—"}
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="text-[11px] text-zinc-500">Volume vs avg</div>
+                  <div className="mt-1 text-sm">
+                    {insights.ok && insights.volNow !== null && insights.volAvg !== null ? (
+                      <span
+                        className={
+                          insights.volTone === "good"
+                            ? "text-emerald-200"
+                            : insights.volTone === "bad"
+                            ? "text-red-200"
+                            : "text-zinc-200"
+                        }
+                      >
+                        {insights.volAvg
+                          ? `${(insights.volNow / insights.volAvg).toFixed(2)}×`
+                          : "—"}
+                      </span>
+                    ) : (
+                      <span className="text-zinc-500">—</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Meta line */}
+              <div className="text-xs text-zinc-500">
+                Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last {candles.length || 0} candles
+              </div>
             </div>
           </div>
 
