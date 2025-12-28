@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,6 +15,7 @@ import time
 import os
 import hashlib
 import json
+import re
 from datetime import datetime
 
 # ----------------------------
@@ -46,7 +48,10 @@ MODEL_DIR = os.getenv("MODEL_DIR", "./model_store")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 def _safe_sym_tf(symbol: str, tf: str) -> str:
-    return f"{symbol.upper().strip()}_{tf.lower().strip()}"
+    # allow pairs like BTC-USD; map any non [A-Za-z0-9] to '_'
+    sym = re.sub(r"[^A-Za-z0-9]+", "_", symbol.upper().strip())
+    t = re.sub(r"[^A-Za-z0-9]+", "_", tf.lower().strip())
+    return f"{sym}_{t}"
 
 def _model_path(symbol: str, tf: str, model_type: str) -> str:
     key = _safe_sym_tf(symbol, tf)
@@ -125,14 +130,46 @@ class ForecastRequest(BaseModel):
     timeframe: str = "daily"  # "daily" or "weekly"
     horizons: Optional[List[int]] = None  # e.g. [1,3,5]
 
+# ---- Crypto request models ----
+class CryptoPredictRequest(BaseModel):
+    pair: str  # e.g. BTC-USD
+    timeframe: str = "daily"  # hourly | daily | weekly
+    model: Optional[Literal["rf", "torch"]] = None  # optional override
+
+class CryptoForecastRequest(BaseModel):
+    pair: str
+    timeframe: str = "daily"  # hourly | daily | weekly
+    horizons: Optional[List[int]] = None
+    model: Optional[Literal["rf", "torch"]] = None
+
+
 def normalize_timeframe(tf: str) -> str:
     tf = (tf or "").strip().lower()
     if tf not in ("daily", "weekly"):
         raise HTTPException(status_code=400, detail="timeframe must be daily or weekly")
     return tf
 
+def normalize_crypto_timeframe(tf: str) -> str:
+    tf = (tf or "").strip().lower()
+    if tf not in ("hourly", "daily", "weekly"):
+        raise HTTPException(status_code=400, detail="crypto timeframe must be hourly, daily, or weekly")
+    return tf
+
 def default_horizons(tf: str) -> list[int]:
     return [1, 3, 5] if tf == "daily" else [1, 2, 4]
+
+def crypto_default_horizons(tf: str) -> list[int]:
+    if tf == "hourly":
+        return [1, 6, 24]
+    if tf == "daily":
+        return [1, 3, 7]
+    return [1, 2, 4]
+
+def _coinbase_granularity(tf: str) -> int:
+    return 3600 if tf == "hourly" else 86400
+
+def _is_valid_crypto_pair(pair: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z0-9]{2,12}-[A-Z0-9]{2,12}", (pair or "").upper().strip()))
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -145,6 +182,12 @@ def get_feature_cols() -> list[str]:
     return [
         "ret_1", "ret_5", "ma_5", "ma_10", "vol_10", "volume_ma_10",
         "spy_ret_1", "qqq_ret_1", "rel_spy_1", "rel_qqq_1", "corr_spy_20",
+    ]
+
+def get_feature_cols_crypto() -> list[str]:
+    return [
+        "ret_1", "ret_5", "ma_5", "ma_10", "vol_10", "volume_ma_10",
+        "btc_ret_1", "eth_ret_1", "rel_btc_1", "rel_eth_1", "corr_btc_20",
     ]
 
 def build_rf(params: Optional[dict] = None) -> RandomForestRegressor:
@@ -177,8 +220,6 @@ if TORCH_AVAILABLE:
         def forward(self, x):
             return self.net(x)
 else:
-    # Dummy placeholder to prevent NameError during import when torch isn't installed.
-    # Any attempt to train/predict with torch will raise a clear error via helpers below.
     TorchMLP = None  # type: ignore
 
 
@@ -192,7 +233,6 @@ def _torch_train_and_fit(X: np.ndarray, y: np.ndarray, epochs: int = 60, lr: flo
     X = X.astype(np.float32)
     y = y.astype(np.float32).reshape(-1, 1)
 
-    # normalize features
     mu = X.mean(axis=0)
     sig = X.std(axis=0)
     sig = np.where(sig < 1e-8, 1.0, sig)
@@ -231,7 +271,6 @@ def _torch_predict(fit_obj: Any, x: np.ndarray) -> float:
 
 
 def _torch_save(fit_obj: Any, path: str, meta: dict):
-    """Save torch weights + normalization + meta."""
     if not TORCH_AVAILABLE:
         return
     payload = {
@@ -282,7 +321,7 @@ def _date_key_today_utc() -> str:
 
 
 # ----------------------------
-# Data fetching
+# Data fetching (stocks)
 # ----------------------------
 def fetch_stooq_ohlcv(symbol: str) -> pd.DataFrame:
     cache_key = f"stooq:{symbol.lower().strip()}:daily"
@@ -332,6 +371,88 @@ def get_symbol_df(symbol: str, tf: str) -> pd.DataFrame:
         df = to_weekly(df)
     return df
 
+
+# ----------------------------
+# Data fetching (crypto - Coinbase Exchange, no API key)
+# ----------------------------
+def fetch_coinbase_ohlcv(pair: str, tf: str) -> pd.DataFrame:
+    """Fetch OHLCV candles from Coinbase Exchange (no API key)."""
+    pair_u = (pair or "").upper().strip()
+    if not _is_valid_crypto_pair(pair_u):
+        raise HTTPException(status_code=400, detail="Invalid crypto pair. Use format like BTC-USD")
+
+    tf_n = normalize_crypto_timeframe(tf)
+    gran = _coinbase_granularity(tf_n if tf_n != "weekly" else "daily")
+
+    cache_key = f"coinbase:{pair_u}:{gran}"
+    cached = cache_get(_data_cache, cache_key, DATA_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached.copy()
+
+    url = f"https://api.exchange.coinbase.com/products/{pair_u}/candles"
+    params = {"granularity": gran}
+    headers = {"User-Agent": "stock-predictor/1.0", "Accept": "application/json"}
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=20)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Coinbase request failed: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Coinbase error: {r.status_code}")
+
+    data = r.json()
+    # rows: [time, low, high, open, close, volume]
+    if not isinstance(data, list) or len(data) < 10:
+        raise HTTPException(status_code=502, detail="Coinbase returned no candle data")
+
+    rows = []
+    for row in data:
+        try:
+            ts, low, high, open_, close, vol = row
+            rows.append((
+                datetime.utcfromtimestamp(int(ts)),
+                float(open_), float(high), float(low), float(close), float(vol)
+            ))
+        except Exception:
+            continue
+
+    if len(rows) < 10:
+        raise HTTPException(status_code=502, detail="Coinbase candle parse failed")
+
+    df = pd.DataFrame(rows, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    cache_set(_data_cache, cache_key, df)
+    return df
+
+def to_weekly_crypto(df: pd.DataFrame) -> pd.DataFrame:
+    weekly = (
+        df.set_index("Date")
+          .resample("W-SUN")
+          .agg({
+              "Open": "first",
+              "High": "max",
+              "Low": "min",
+              "Close": "last",
+              "Volume": "sum",
+          })
+          .dropna()
+          .reset_index()
+    )
+    return weekly
+
+def get_crypto_df(pair: str, tf: str) -> pd.DataFrame:
+    tf_n = normalize_crypto_timeframe(tf)
+    df = fetch_coinbase_ohlcv(pair, tf_n)
+    if tf_n == "weekly":
+        df = to_weekly_crypto(df)
+    return df
+
+
+# ----------------------------
+# Feature builders
+# ----------------------------
 def make_features_with_market(stock_df: pd.DataFrame, spy_df: pd.DataFrame, qqq_df: pd.DataFrame) -> pd.DataFrame:
     s = stock_df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
     spy = spy_df[["Date", "Close"]].rename(columns={"Close": "SPY_Close"})
@@ -355,6 +476,35 @@ def make_features_with_market(stock_df: pd.DataFrame, spy_df: pd.DataFrame, qqq_
     out["rel_qqq_1"] = out["ret_1"] - out["qqq_ret_1"]
 
     out["corr_spy_20"] = out["ret_1"].rolling(20).corr(out["spy_ret_1"])
+
+    out["target_next_close"] = out["Close"].shift(-1)
+    out = out.dropna().reset_index(drop=True)
+    return out
+
+def make_features_with_crypto_market(asset_df: pd.DataFrame, btc_df: pd.DataFrame, eth_df: pd.DataFrame) -> pd.DataFrame:
+    """Build features for crypto using BTC + ETH as market context."""
+    a = asset_df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
+    btc = btc_df[["Date", "Close"]].rename(columns={"Close": "BTC_Close"})
+    eth = eth_df[["Date", "Close"]].rename(columns={"Close": "ETH_Close"})
+
+    out = a.merge(btc, on="Date", how="left").merge(eth, on="Date", how="left")
+    out["BTC_Close"] = out["BTC_Close"].ffill()
+    out["ETH_Close"] = out["ETH_Close"].ffill()
+
+    out["ret_1"] = out["Close"].pct_change(1)
+    out["ret_5"] = out["Close"].pct_change(5)
+    out["ma_5"] = out["Close"].rolling(5).mean()
+    out["ma_10"] = out["Close"].rolling(10).mean()
+    out["vol_10"] = out["Close"].rolling(10).std()
+    out["volume_ma_10"] = out["Volume"].rolling(10).mean()
+
+    out["btc_ret_1"] = out["BTC_Close"].pct_change(1)
+    out["eth_ret_1"] = out["ETH_Close"].pct_change(1)
+
+    out["rel_btc_1"] = out["ret_1"] - out["btc_ret_1"]
+    out["rel_eth_1"] = out["ret_1"] - out["eth_ret_1"]
+
+    out["corr_btc_20"] = out["ret_1"].rolling(20).corr(out["btc_ret_1"])
 
     out["target_next_close"] = out["Close"].shift(-1)
     out = out.dropna().reset_index(drop=True)
@@ -514,7 +664,6 @@ def _update_bias_from_latest_known(
     if bias_obj.get("last_date_key") == last_date_key:
         return bias_obj  # already updated for this latest candle
 
-    # second-last row predicts last close
     row = feat.iloc[-2]
     true_next = float(row["target_next_close"])
 
@@ -528,7 +677,7 @@ def _update_bias_from_latest_known(
     except Exception:
         return bias_obj
 
-    err = true_next - pred_next  # positive => model too low
+    err = true_next - pred_next
     alpha = float(bias_obj.get("alpha", 0.20))
     old_bias = float(bias_obj.get("bias", 0.0))
     new_bias = (1 - alpha) * old_bias + alpha * err
@@ -593,6 +742,280 @@ def history(symbol: str, timeframe: str = "daily", points: int = 200):
     return payload
 
 
+# ----------------------------
+# Crypto endpoints
+# ----------------------------
+@app.get("/crypto/symbols")
+def crypto_symbols():
+    return {
+        "items": [
+            {"pair": "BTC-USD", "name": "Bitcoin"},
+            {"pair": "ETH-USD", "name": "Ethereum"},
+            {"pair": "SOL-USD", "name": "Solana"},
+            {"pair": "XRP-USD", "name": "XRP"},
+            {"pair": "ADA-USD", "name": "Cardano"},
+            {"pair": "DOGE-USD", "name": "Dogecoin"},
+            {"pair": "AVAX-USD", "name": "Avalanche"},
+            {"pair": "LINK-USD", "name": "Chainlink"},
+            {"pair": "MATIC-USD", "name": "Polygon"},
+        ],
+        "source": "static",
+    }
+
+@app.get("/crypto/history/{pair}")
+def crypto_history(pair: str, timeframe: str = "daily", points: int = 200):
+    pair_u = (pair or "").upper().strip()
+    if not _is_valid_crypto_pair(pair_u):
+        raise HTTPException(status_code=400, detail="Invalid crypto pair. Use format like BTC-USD")
+
+    tf = normalize_crypto_timeframe(timeframe)
+    key = f"crypto:{pair_u}:{tf}:{points}"
+
+    cached = cache_get(_hist_cache, key, HIST_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
+    df = get_crypto_df(pair_u, tf)
+    if len(df) < 30:
+        raise HTTPException(status_code=400, detail="Not enough history")
+
+    df = df.tail(points).copy()
+
+    candles = [
+        {
+            "time": d.strftime("%Y-%m-%d %H:%M") if tf == "hourly" else d.strftime("%Y-%m-%d"),
+            "open": float(o),
+            "high": float(h),
+            "low": float(l),
+            "close": float(c),
+            "volume": float(v),
+        }
+        for d, o, h, l, c, v in zip(df["Date"], df["Open"], df["High"], df["Low"], df["Close"], df["Volume"])
+    ]
+
+    payload = {"pair": pair_u, "timeframe": tf, "candles": candles}
+    cache_set(_hist_cache, key, payload)
+    return payload
+
+@app.post("/crypto/predict")
+def crypto_predict(req: CryptoPredictRequest):
+    pair = (req.pair or "").upper().strip()
+    if not _is_valid_crypto_pair(pair):
+        raise HTTPException(status_code=400, detail="Invalid crypto pair. Use format like BTC-USD")
+
+    tf = normalize_crypto_timeframe(req.timeframe)
+
+    requested_model = (req.model or DEFAULT_MODEL_TYPE).strip().lower()
+    if requested_model not in ("rf", "torch"):
+        requested_model = "rf"
+    if requested_model == "torch" and not TORCH_AVAILABLE:
+        requested_model = "rf"
+
+    cache_key = f"crypto:{pair}:{tf}:{requested_model}"
+    cached = cache_get(_pred_cache, cache_key, PRED_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
+    asset_df = get_crypto_df(pair, tf)
+    last_date = asset_df["Date"].iloc[-1]
+    last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
+
+    btc_df = get_crypto_df("BTC-USD", tf)
+    eth_df = get_crypto_df("ETH-USD", tf)
+
+    if len(asset_df) < 160 or len(btc_df) < 160 or len(eth_df) < 160:
+        raise HTTPException(status_code=400, detail="Not enough history to model")
+
+    feat = make_features_with_crypto_market(asset_df, btc_df, eth_df)
+    feat = feat.tail(800).reset_index(drop=True)
+
+    feature_cols = get_feature_cols_crypto()
+    X = feat[feature_cols].values.astype(float)
+    y = feat["target_next_close"].values.astype(float)
+
+    model_key = f"model:crypto:{pair}:{tf}:{requested_model}"
+    model_cached = cache_get(_model_cache, model_key, MODEL_CACHE_TTL_SEC)
+
+    model_cache_hit = False
+    model_obj = None
+
+    if isinstance(model_cached, dict) and model_cached.get("last_date") == last_date_key:
+        model_obj = model_cached.get("model")
+        model_cache_hit = model_obj is not None
+
+    if not model_cache_hit and requested_model == "torch" and TORCH_AVAILABLE:
+        loaded = _torch_load(_torch_path(pair, tf))
+        if loaded and (loaded.get("meta") or {}).get("last_date") == last_date_key:
+            model_obj = loaded
+            model_cache_hit = True
+
+    if not model_cache_hit:
+        if requested_model == "torch":
+            model_obj = _torch_train_and_fit(X, y, epochs=60, lr=1e-3)
+            _torch_save(model_obj, _torch_path(pair, tf), meta={"last_date": last_date_key, "feature_cols": feature_cols})
+        else:
+            model_obj = RandomForestRegressor(
+                n_estimators=160,
+                random_state=42,
+                n_jobs=-1,
+                max_depth=12,
+                min_samples_leaf=2,
+                max_features="sqrt",
+            )
+            model_obj.fit(X, y)
+
+        cache_set(_model_cache, model_key, {
+            "model": model_obj,
+            "last_date": last_date_key,
+            "feature_cols": feature_cols,
+            "model_type": requested_model,
+        })
+
+    bias_obj = _update_bias_from_latest_known(
+        symbol=pair,
+        tf=tf,
+        feat=feat,
+        feature_cols=feature_cols,
+        model_type=requested_model,
+        model_obj=model_obj,
+        last_date_key=last_date_key,
+    )
+    bias = float(bias_obj.get("bias", 0.0))
+
+    latest = feat.iloc[-1]
+    x_latest = latest[feature_cols].values.astype(float)
+
+    if requested_model == "torch":
+        pred_next_close = float(_torch_predict(model_obj, x_latest))
+    else:
+        pred_next_close = float(model_obj.predict(x_latest.reshape(1, -1))[0])
+
+    pred_next_close_adj = pred_next_close + bias
+
+    last_close = float(asset_df["Close"].iloc[-1])
+
+    rets = asset_df["Close"].pct_change().dropna()
+    recent_vol = float(rets.rolling(20).std().dropna().iloc[-1]) if len(rets) >= 25 else float(rets.std())
+    if not np.isfinite(recent_vol) or recent_vol <= 0:
+        recent_vol = 0.03
+
+    low = pred_next_close_adj * (1 - recent_vol)
+    high = pred_next_close_adj * (1 + recent_vol)
+    confidence = float(np.clip(1 - (recent_vol * 5), 0.05, 0.9))
+
+    btc_last = float(btc_df["Close"].iloc[-1])
+    eth_last = float(eth_df["Close"].iloc[-1])
+    btc_ret_1 = float((btc_df["Close"].pct_change().dropna().iloc[-1]) if len(btc_df) > 2 else 0.0)
+    eth_ret_1 = float((eth_df["Close"].pct_change().dropna().iloc[-1]) if len(eth_df) > 2 else 0.0)
+
+    payload = {
+        "pair": pair,
+        "timeframe": tf,
+        "last_close": round(last_close, 2),
+        "prediction": round(pred_next_close_adj, 2),
+        "range_low": round(low, 2),
+        "range_high": round(high, 2),
+        "confidence": round(confidence, 2),
+        "data_points": int(len(asset_df)),
+        "source": "coinbase",
+        "model_type": requested_model,
+        "torch_available": TORCH_AVAILABLE,
+        "learning": {
+            "bias": round(bias, 4),
+            "bias_alpha": float(bias_obj.get("alpha", 0.20)),
+            "bias_last_err": float(bias_obj.get("last_err", 0.0)) if "last_err" in bias_obj else None,
+            "bias_updated_at": bias_obj.get("updated_at"),
+        },
+        "market": {
+            "BTC_last_close": round(btc_last, 2),
+            "ETH_last_close": round(eth_last, 2),
+            "BTC_ret_1": round(btc_ret_1 * 100, 2),
+            "ETH_ret_1": round(eth_ret_1 * 100, 2),
+        },
+        "cache": {"hit": False, "ttl_sec": PRED_CACHE_TTL_SEC, "model_hit": bool(model_cache_hit)},
+    }
+
+    cache_set(_pred_cache, cache_key, payload)
+    return payload
+
+@app.post("/crypto/forecast")
+def crypto_forecast(req: CryptoForecastRequest):
+    pair = (req.pair or "").upper().strip()
+    if not _is_valid_crypto_pair(pair):
+        raise HTTPException(status_code=400, detail="Invalid crypto pair. Use format like BTC-USD")
+
+    tf = normalize_crypto_timeframe(req.timeframe)
+
+    horizons = req.horizons or crypto_default_horizons(tf)
+    try:
+        horizons = [int(h) for h in horizons]
+    except Exception:
+        horizons = crypto_default_horizons(tf)
+
+    horizons = [h for h in horizons if 1 <= h <= 48]
+    horizons = sorted(list(dict.fromkeys(horizons)))
+    if not horizons:
+        horizons = crypto_default_horizons(tf)
+
+    asset_df = get_crypto_df(pair, tf)
+    last_date = asset_df["Date"].iloc[-1]
+    last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
+
+    cache_key = f"crypto_fc:{pair}:{tf}:{last_date_key}:{','.join(str(h) for h in horizons)}"
+    cached = cache_get(_forecast_cache, cache_key, FORECAST_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
+    pred_payload = cache_get(_pred_cache, f"crypto:{pair}:{tf}:{DEFAULT_MODEL_TYPE}", PRED_CACHE_TTL_SEC)
+    if pred_payload is None:
+        pred_payload = crypto_predict(CryptoPredictRequest(pair=pair, timeframe=tf, model=DEFAULT_MODEL_TYPE))
+
+    last_close = float(pred_payload.get("last_close", asset_df["Close"].iloc[-1]))
+    pred_next = float(pred_payload.get("prediction", last_close))
+
+    r1 = (pred_next / last_close - 1.0) if last_close else 0.0
+
+    rets = asset_df["Close"].pct_change().dropna()
+    vol = float(rets.rolling(20).std().dropna().iloc[-1]) if len(rets) >= 25 else float(rets.std())
+    if not np.isfinite(vol) or vol <= 0:
+        vol = 0.03
+
+    items: list[dict[str, Any]] = []
+    for h in horizons:
+        pred_h = float(last_close * (1.0 + r1 * h))
+        band = last_close * vol * (h ** 0.5) * 1.25
+        range_low = float(pred_h - band)
+        range_high = float(pred_h + band)
+
+        change_pct = ((pred_h - last_close) / last_close) * 100 if last_close else 0.0
+        conf = clamp(1.0 - (abs(vol) * (h ** 0.5) * 6.0), 0.05, 0.95)
+
+        items.append({
+            "horizon": int(h),
+            "prediction": round(pred_h, 2),
+            "range_low": round(range_low, 2),
+            "range_high": round(range_high, 2),
+            "change_pct": round(change_pct, 2),
+            "confidence": round(conf, 2),
+        })
+
+    payload = {
+        "pair": pair,
+        "timeframe": tf,
+        "last_close": round(last_close, 2),
+        "as_of": last_date_key,
+        "horizons": items,
+        "source": "coinbase",
+        "cache": {"ttl_sec": FORECAST_CACHE_TTL_SEC},
+    }
+
+    cache_set(_forecast_cache, cache_key, payload)
+    return payload
+
+
+# ----------------------------
+# Stock endpoints (existing)
+# ----------------------------
 @app.post("/predict")
 def predict(req: PredictRequest):
     symbol = req.symbol.upper().strip()
@@ -605,18 +1028,14 @@ def predict(req: PredictRequest):
     if requested_model not in ("rf", "torch"):
         requested_model = "rf"
     if requested_model == "torch" and not TORCH_AVAILABLE:
-        requested_model = "rf"  # auto fallback
+        requested_model = "rf"
 
-    # cache key includes model type so switching doesn't clash
     cache_key = f"{symbol}:{tf}:{requested_model}"
-
     cached = cache_get(_pred_cache, cache_key, PRED_CACHE_TTL_SEC)
     if cached is not None:
         return cached
 
-    # Fetch data
     stock_df = get_symbol_df(symbol, tf)
-
     last_date = stock_df["Date"].iloc[-1]
     last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
 
@@ -649,7 +1068,6 @@ def predict(req: PredictRequest):
     X = feat[feature_cols].values.astype(float)
     y = feat["target_next_close"].values.astype(float)
 
-    # --- Model caching (RAM) ---
     model_key = f"model:{symbol}:{tf}:{requested_model}"
     model_cached = cache_get(_model_cache, model_key, MODEL_CACHE_TTL_SEC)
 
@@ -660,23 +1078,16 @@ def predict(req: PredictRequest):
         model_obj = model_cached.get("model")
         model_cache_hit = model_obj is not None
 
-    # --- Disk load (fast start) ---
     if not model_cache_hit:
         if requested_model == "torch" and TORCH_AVAILABLE:
             loaded = _torch_load(_torch_path(symbol, tf))
             if loaded and (loaded.get("meta") or {}).get("last_date") == last_date_key:
                 model_obj = loaded
                 model_cache_hit = True
-        elif requested_model == "rf":
-            # RF persistence could be added, but sklearn pickle in Render can be flaky; keeping RAM cache for now.
-            pass
 
-    # --- Train if needed ---
     if not model_cache_hit:
         if requested_model == "torch":
-            # keep it fast for MVP
             model_obj = _torch_train_and_fit(X, y, epochs=60, lr=1e-3)
-            # save torch model
             _torch_save(model_obj, _torch_path(symbol, tf), meta={"last_date": last_date_key, "feature_cols": feature_cols})
         else:
             p = tuned_params or {"n_estimators": 140, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
@@ -697,7 +1108,6 @@ def predict(req: PredictRequest):
             "model_type": requested_model,
         })
 
-    # --- Update bias (“learn from mistakes”) using known last day ---
     bias_obj = _update_bias_from_latest_known(
         symbol=symbol,
         tf=tf,
@@ -709,7 +1119,6 @@ def predict(req: PredictRequest):
     )
     bias = float(bias_obj.get("bias", 0.0))
 
-    # --- Predict next close ---
     latest = feat.iloc[-1]
     x_latest = latest[feature_cols].values.astype(float)
 
@@ -718,12 +1127,9 @@ def predict(req: PredictRequest):
     else:
         pred_next_close = float(model_obj.predict(x_latest.reshape(1, -1))[0])
 
-    # Apply bias correction (learning)
     pred_next_close_adj = pred_next_close + bias
-
     last_close = float(stock_df["Close"].iloc[-1])
 
-    # Range estimate from recent volatility
     rets = stock_df["Close"].pct_change().dropna()
     recent_vol = float(rets.rolling(20).std().dropna().iloc[-1]) if len(rets) >= 25 else float(rets.std())
     if not np.isfinite(recent_vol) or recent_vol <= 0:
@@ -731,10 +1137,8 @@ def predict(req: PredictRequest):
 
     low = pred_next_close_adj * (1 - recent_vol)
     high = pred_next_close_adj * (1 + recent_vol)
-
     confidence = float(np.clip(1 - (recent_vol * 5), 0.05, 0.9))
 
-    # Market summary
     spy_last = float(spy_df["Close"].iloc[-1])
     qqq_last = float(qqq_df["Close"].iloc[-1])
     spy_ret_1 = float((spy_df["Close"].pct_change().dropna().iloc[-1]) if len(spy_df) > 2 else 0.0)
@@ -812,7 +1216,7 @@ def forecast(req: ForecastRequest):
 
     pred_payload = cache_get(_pred_cache, f"{symbol}:{tf}:{DEFAULT_MODEL_TYPE}", PRED_CACHE_TTL_SEC)
     if pred_payload is None:
-        pred_payload = predict(PredictRequest(symbol=symbol, timeframe=tf, model=DEFAULT_MODEL_TYPE))  # populates caches
+        pred_payload = predict(PredictRequest(symbol=symbol, timeframe=tf, model=DEFAULT_MODEL_TYPE))
 
     last_close = float(pred_payload.get("last_close", stock_df["Close"].iloc[-1]))
     pred_next = float(pred_payload.get("prediction", last_close))
@@ -958,7 +1362,6 @@ def news(mode: str = "market", symbol: Optional[str] = None, limit: int = 6):
 
     token = os.getenv("MARKET_AUX_TOKEN")
 
-    # Placeholder
     if not token:
         if mode == "market":
             items = [
@@ -995,7 +1398,6 @@ def news(mode: str = "market", symbol: Optional[str] = None, limit: int = 6):
         cache_set(_news_cache, cache_key, payload)
         return payload
 
-    # Live Marketaux
     url = "https://api.marketaux.com/v1/news/all"
     params = {
         "api_token": token,
@@ -1089,7 +1491,7 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
         sym = str(row[sym_col]).strip().upper()
         if not sym:
             continue
-        sym_alt = sym.replace(".", "-")  # BRK.B -> BRK-B
+        sym_alt = sym.replace(".", "-")
         name = str(row[name_col]).strip()
         sector = str(row[sector_col]).strip() if sector_col else ""
 
@@ -1168,50 +1570,35 @@ def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
 # ----------------------------
 # Warmup (reduces first-request latency)
 # ----------------------------
-
 ENABLE_WARMUP = os.getenv("ENABLE_WARMUP", "1") == "1"
 WARMUP_SYMBOLS = os.getenv("WARMUP_SYMBOLS", "SPY,QQQ,AAPL")
 WARMUP_WEEKLY = os.getenv("WARMUP_WEEKLY", "1") == "1"
-# Optional: also warm model/prediction caches (slower startup, much faster first click)
 WARMUP_PREDICT = os.getenv("WARMUP_PREDICT", "0") == "1"
-# Comma-separated list: rf,torch (defaults to DEFAULT_MODEL_TYPE)
 WARMUP_MODEL_TYPES = os.getenv("WARMUP_MODEL_TYPES", "").strip()
-# Limit how many symbols we actually run predict on (keep startup reasonable)
 WARMUP_PREDICT_MAX_SYMBOLS = int(os.getenv("WARMUP_PREDICT_MAX_SYMBOLS", "2"))
-
 
 @app.on_event("startup")
 def _startup_warmup() -> None:
-    """Pre-fetch common datasets so the first user click is fast.
-
-    This warms the in-memory data cache used by Stooq downloads.
-    """
     if not ENABLE_WARMUP:
         return
 
     t0 = time.time()
-
-    # Warm daily always; optionally warm weekly too
     tfs = ["daily", "weekly"] if WARMUP_WEEKLY else ["daily"]
 
-    # Normalize symbols
     syms = [s.strip().upper() for s in WARMUP_SYMBOLS.split(",") if s.strip()]
     if not syms:
         syms = ["SPY", "QQQ", "AAPL"]
 
     warmed = 0
 
-    # 1) Warm market ETFs + a default ticker into _data_cache
     for tf in tfs:
         for sym in syms:
             try:
-                # get_symbol_df() calls fetch_stooq_ohlcv() which populates _data_cache
                 _ = get_symbol_df(sym, tf)
                 warmed += 1
             except Exception:
                 continue
 
-    # 2) Try to warm the S&P 500 symbol list cache (so the dropdown loads instantly)
     try:
         items = _fetch_sp500_from_free_csv()
         payload = {
@@ -1223,38 +1610,29 @@ def _startup_warmup() -> None:
         }
         cache_set(_symbols_cache, "sp500:v2", payload)
     except Exception:
-        # If blocked, we'll fall back to the existing runtime fallback behavior
         pass
 
-    # 3) Optionally warm prediction/model caches (so first Predict click is fast)
     if WARMUP_PREDICT:
-        # Decide model types to warm
         if WARMUP_MODEL_TYPES:
             model_types = [m.strip().lower() for m in WARMUP_MODEL_TYPES.split(",") if m.strip()]
         else:
             model_types = [DEFAULT_MODEL_TYPE]
 
-        # Respect torch availability
         model_types = [m for m in model_types if m in ("rf", "torch")]
         if not TORCH_AVAILABLE:
             model_types = [m for m in model_types if m != "torch"]
 
-        # Only warm a small number of non-market symbols (SPY/QQQ are already warmed as data)
-        # We prefer warming AAPL first if present.
         warm_syms = [s for s in syms if s not in ("SPY", "QQQ")]
         if "AAPL" in syms and "AAPL" not in warm_syms:
             warm_syms = ["AAPL"] + warm_syms
         warm_syms = warm_syms[:max(0, WARMUP_PREDICT_MAX_SYMBOLS)]
 
-        pred_warmed = 0
         for tf in tfs:
             for sym in warm_syms:
                 for m in model_types:
                     try:
                         _ = predict(PredictRequest(symbol=sym, timeframe=tf, model=m))
-                        # also warm a small forecast cache since frontend calls it
                         _ = forecast(ForecastRequest(symbol=sym, timeframe=tf, horizons=None))
-                        pred_warmed += 1
                     except Exception:
                         continue
 
