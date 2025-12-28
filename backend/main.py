@@ -625,23 +625,26 @@ def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
 # Symbols: S&P 500 (free source)
 # ----------------------------
 
-def _fetch_sp500_from_wikipedia() -> list[dict[str, Any]]:
-    """Fetch S&P 500 constituents from Wikipedia (free)."""
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
+    """Fetch S&P 500 constituents from a free CSV dataset.
 
-    tables = pd.read_html(url)
-    if not tables:
-        raise RuntimeError("No tables found on Wikipedia page")
+    This avoids HTML parsing dependencies that can fail on some hosts.
+    """
+    url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
 
-    df = tables[0]
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
 
+    df = pd.read_csv(StringIO(r.text))
+
+    # Expected columns: Symbol, Name, Sector
     cols = {str(c).lower(): c for c in df.columns}
     sym_col = cols.get("symbol")
-    name_col = cols.get("security")
-    sector_col = cols.get("gics sector")
+    name_col = cols.get("name")
+    sector_col = cols.get("sector")
 
     if not sym_col or not name_col:
-        raise RuntimeError("Unexpected table schema for S&P 500 page")
+        raise RuntimeError("Unexpected CSV schema for S&P 500 constituents")
 
     out: list[dict[str, Any]] = []
     for _, row in df.iterrows():
@@ -679,10 +682,10 @@ def symbols_sp500(limit: int = 2000):
         return cached
 
     try:
-        items = _fetch_sp500_from_wikipedia()
-        source = "wikipedia"
+        items = _fetch_sp500_from_free_csv()
+        source = "free_csv"
     except Exception:
-        # Fallback if Wikipedia is temporarily unavailable
+        # Fallback if CSV is temporarily unavailable
         items = [
             {"symbol": "AAPL", "symbol_alt": None, "name": "Apple Inc.", "sector": "Information Technology"},
             {"symbol": "MSFT", "symbol_alt": None, "name": "Microsoft", "sector": "Information Technology"},
@@ -692,12 +695,15 @@ def symbols_sp500(limit: int = 2000):
         ]
         source = "fallback"
 
+    # Apply limit (default allows all ~500)
     limit = int(max(1, min(limit, 2000)))
+    items_out = items[:limit]
+
     payload = {
-        "items": items,
+        "items": items_out,
         "source": source,
         "cache_ttl_sec": SYMBOLS_CACHE_TTL_SEC,
-        "count": min(len(items), limit),
+        "count": len(items_out),
     }
     cache_set(_symbols_cache, cache_key, payload)
     return payload
