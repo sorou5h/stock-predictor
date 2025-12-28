@@ -11,6 +11,8 @@ import CandleChart from "../components/CandleChart";
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8001";
 
+type AssetType = "stock" | "crypto";
+
 type PredictResponse = {
   symbol: string;
   timeframe: "daily" | "weekly";
@@ -21,7 +23,7 @@ type PredictResponse = {
   confidence: number;
   data_points: number;
   source: string;
-  market: {
+  market?: {
     SPY_last_close: number;
     QQQ_last_close: number;
     SPY_ret_1: number; // percent
@@ -84,12 +86,22 @@ type SymbolItem = {
   sector?: string;
 };
 
-
 type SymbolsResponse = {
   items: SymbolItem[];
   source: string;
   count: number;
   cache_ttl_sec: number;
+};
+
+type CryptoSymbolItem = {
+  symbol: string; // e.g. BTC
+  name?: string | null;
+};
+
+type CryptoSymbolsResponse = {
+  items: CryptoSymbolItem[];
+  source: string;
+  count: number;
 };
 
 type BacktestResponse = {
@@ -120,7 +132,10 @@ function Skeleton({ className = "" }: { className?: string }) {
 }
 
 function fmtMoney(n: number) {
-  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return n.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }
 
 function clamp01(x: number) {
@@ -130,6 +145,7 @@ function clamp01(x: number) {
 export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
   const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
+  const [assetType, setAssetType] = useState<AssetType>("stock");
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState<string | null>(null);
   const [pred, setPred] = useState<PredictResponse | null>(null);
@@ -160,10 +176,65 @@ export default function Home() {
   const [symbolsLoading, setSymbolsLoading] = useState(false);
   const [symbolsError, setSymbolsError] = useState<string | null>(null);
 
+  const [cryptoSymbols, setCryptoSymbols] = useState<CryptoSymbolItem[]>([]);
+  const [cryptoSymbolsLoading, setCryptoSymbolsLoading] = useState(false);
+  const [cryptoSymbolsError, setCryptoSymbolsError] = useState<string | null>(
+    null
+  );
+
   const [symbolQuery, setSymbolQuery] = useState("AAPL");
   const [comboOpen, setComboOpen] = useState(false);
 
   const candles = useMemo(() => hist?.candles ?? [], [hist]);
+
+  // -------- API helpers (stock/crypto routing) --------
+  function apiPath(p: string) {
+    return `${API_BASE}${p}`;
+  }
+
+  function isCrypto() {
+    return assetType === "crypto";
+  }
+
+  function predictUrl() {
+    return apiPath(isCrypto() ? "/crypto/predict" : "/predict");
+  }
+
+  function forecastUrl() {
+    return apiPath(isCrypto() ? "/crypto/forecast" : "/forecast");
+  }
+
+  function historyUrl(sym: string, tf: string, pts: number) {
+    const base = isCrypto()
+      ? `/crypto/history/${encodeURIComponent(sym)}`
+      : `/history/${encodeURIComponent(sym)}`;
+    return apiPath(`${base}?timeframe=${tf}&points=${pts}`);
+  }
+
+  function backtestUrl(sym: string, tf: string, force: boolean) {
+    if (isCrypto()) return null;
+    return apiPath(
+      `/backtest/${encodeURIComponent(sym)}?timeframe=${tf}&force=${
+        force ? "true" : "false"
+      }`
+    );
+  }
+
+  function symbolsUrl() {
+    return apiPath("/symbols/sp500?limit=2000");
+  }
+
+  function cryptoSymbolsUrl() {
+    return apiPath("/crypto/symbols?limit=500");
+  }
+
+  function newsUrl(tab: "market" | "ticker", sym: string) {
+    const s = sym.trim().toUpperCase();
+    if (tab === "market") return apiPath("/news?mode=market&limit=6");
+    return apiPath(
+      `/news?mode=ticker&symbol=${encodeURIComponent(s)}&limit=6`
+    );
+  }
 
   useEffect(() => {
     const t = hist?.candles?.[hist.candles.length - 1]?.time;
@@ -178,15 +249,14 @@ export default function Home() {
     const s = sym.trim().toUpperCase();
     if (!s) return;
 
+    const actualTab: "market" | "ticker" =
+      assetType === "crypto" && tab === "ticker" ? "market" : tab;
+
     setNewsLoading(true);
     setNewsError(null);
 
     try {
-      const url =
-        tab === "market"
-          ? `${API_BASE}/news?mode=market&limit=6`
-          : `${API_BASE}/news?mode=ticker&symbol=${encodeURIComponent(s)}&limit=6`;
-
+      const url = newsUrl(actualTab, s);
       const res = await fetch(url);
       if (!res.ok) throw new Error(`News API error: ${res.status}`);
 
@@ -200,18 +270,18 @@ export default function Home() {
     }
   }
 
-  // Warm up backend + load initial market news + S&P 500 symbol list
+  // Warm up backend + load initial market news + BOTH symbol lists
   useEffect(() => {
     fetch(`${API_BASE}/health`)
       .then((r) => setBackendOk(r.ok))
       .catch(() => setBackendOk(false));
 
-    // Load S&P 500 symbols for searchable dropdown
+    // Load S&P 500 symbols
     (async () => {
       setSymbolsLoading(true);
       setSymbolsError(null);
       try {
-        const res = await fetch(`${API_BASE}/symbols/sp500?limit=2000`);
+        const res = await fetch(symbolsUrl());
         if (!res.ok) throw new Error(`Symbols API error: ${res.status}`);
         const json = (await res.json()) as SymbolsResponse;
         setSymbols(json.items ?? []);
@@ -223,11 +293,41 @@ export default function Home() {
       }
     })();
 
+    // Load crypto symbols
+    (async () => {
+      setCryptoSymbolsLoading(true);
+      setCryptoSymbolsError(null);
+      try {
+        const res = await fetch(cryptoSymbolsUrl());
+        if (!res.ok) throw new Error(`Crypto symbols API error: ${res.status}`);
+        const json = (await res.json()) as CryptoSymbolsResponse;
+        setCryptoSymbols(json.items ?? []);
+      } catch (e: any) {
+        setCryptoSymbolsError(e?.message ?? "Failed to load crypto symbols");
+        setCryptoSymbols([]);
+      } finally {
+        setCryptoSymbolsLoading(false);
+      }
+    })();
+
     loadNews("market", symbol);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
   const filteredSymbols = useMemo(() => {
     const q = symbolQuery.trim().toLowerCase();
+
+    if (assetType === "crypto") {
+      const list = cryptoSymbols;
+      if (!q) return list.slice(0, 25);
+      const matches = list.filter((it) => {
+        const sym = (it.symbol ?? "").toLowerCase();
+        const name = (it.name ?? "").toLowerCase();
+        return sym.includes(q) || name.includes(q);
+      });
+      return matches.slice(0, 25);
+    }
+
     if (!q) return symbols.slice(0, 25);
 
     const matches = symbols.filter((it) => {
@@ -239,13 +339,13 @@ export default function Home() {
     });
 
     return matches.slice(0, 25);
-  }, [symbols, symbolQuery]);
+  }, [assetType, symbols, cryptoSymbols, symbolQuery]);
 
   // When tab changes, reload news for the active tab
   useEffect(() => {
     loadNews(newsTab, symbol);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [newsTab]);
+  }, [newsTab, assetType]);
 
   // Also reload ticker news when the symbol changes (only if the ticker tab is active)
   useEffect(() => {
@@ -262,7 +362,7 @@ export default function Home() {
     // Refresh ticker immediately
     fetchLiveQuote(s);
 
-    // Auto-check accuracy (daily cached)
+    // Auto-check accuracy (daily cached) - stocks only
     runBacktest(false, s);
 
     setLoading(true);
@@ -270,8 +370,7 @@ export default function Home() {
 
     const startedAt = Date.now();
 
-    // Friendly rotating status messages
-    const steps = [
+    const stepsStock = [
       "Waking up the AI server…",
       "Downloading the latest market data…",
       "Analyzing past prices…",
@@ -280,6 +379,17 @@ export default function Home() {
       "Predicting the future outcome…",
       "Rendering chart & results…",
     ];
+
+    const stepsCrypto = [
+      "Waking up the AI server…",
+      "Downloading the latest crypto candles…",
+      "Analyzing volatility…",
+      "Training the model (cached for speed)…",
+      "Predicting the next move…",
+      "Rendering chart & results…",
+    ];
+
+    const steps = assetType === "crypto" ? stepsCrypto : stepsStock;
 
     setLoadingMsg(steps[0]);
     let i = 0;
@@ -290,17 +400,13 @@ export default function Home() {
 
     try {
       const [predRes, histRes, fcRes] = await Promise.all([
-        fetch(`${API_BASE}/predict`, {
+        fetch(predictUrl(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ symbol: s, timeframe }),
         }),
-        fetch(
-          `${API_BASE}/history/${encodeURIComponent(
-            s
-          )}?timeframe=${timeframe}&points=200`
-        ),
-        fetch(`${API_BASE}/forecast`, {
+        fetch(historyUrl(s, timeframe, 200)),
+        fetch(forecastUrl(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ symbol: s, timeframe }),
@@ -328,7 +434,6 @@ export default function Home() {
       setForecast(null);
       setBt(null);
     } finally {
-      // Keep the message visible briefly so it doesn't flash too fast
       const elapsed = Date.now() - startedAt;
       const minShowMs = 900;
       if (elapsed < minShowMs) {
@@ -345,14 +450,22 @@ export default function Home() {
     const s = (symRaw ?? symbol).trim().toUpperCase();
     if (!s) return;
 
+    // Crypto: skip backtest (optional)
+    if (assetType === "crypto") {
+      setBt(null);
+      setBtError(null);
+      setBtLoading(false);
+      return;
+    }
+
     setBtLoading(true);
     setBtError(null);
 
     try {
-      const res = await fetch(
-        `${API_BASE}/backtest/${encodeURIComponent(s)}?timeframe=${timeframe}&force=${force ? "true" : "false"}`,
-        { cache: "no-store" }
-      );
+      const url = backtestUrl(s, timeframe, force);
+      if (!url) return;
+
+      const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error(`Backtest API error: ${res.status}`);
 
       const json = (await res.json()) as BacktestResponse;
@@ -371,11 +484,7 @@ export default function Home() {
 
     setLiveLoading(true);
     try {
-      // Use last 2 candles to compute change
-      const res = await fetch(
-        `${API_BASE}/history/${encodeURIComponent(s)}?timeframe=${timeframe}&points=2`,
-        { cache: "no-store" }
-      );
+      const res = await fetch(historyUrl(s, timeframe, 2), { cache: "no-store" });
       if (!res.ok) throw new Error(`Live price error: ${res.status}`);
 
       const j = (await res.json()) as HistoryResponse;
@@ -393,7 +502,6 @@ export default function Home() {
       setLiveChangePct(pct);
       setLiveUpdatedAt(new Date().toLocaleTimeString());
     } catch {
-      // Don't break the page if quote fails
       setLivePrice(null);
       setLiveChangePct(null);
       setLiveUpdatedAt(null);
@@ -408,7 +516,7 @@ export default function Home() {
     const id = window.setInterval(() => fetchLiveQuote(), 30_000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, timeframe]);
+  }, [symbol, timeframe, assetType]);
 
   const changePct =
     pred ? ((pred.prediction - pred.last_close) / pred.last_close) * 100 : null;
@@ -434,11 +542,13 @@ export default function Home() {
       tone === "good"
         ? "border-emerald-700 bg-emerald-950/40 text-emerald-200"
         : tone === "bad"
-          ? "border-red-700 bg-red-950/40 text-red-200"
-          : "border-zinc-700 bg-zinc-950 text-zinc-200";
+        ? "border-red-700 bg-red-950/40 text-red-200"
+        : "border-zinc-700 bg-zinc-950 text-zinc-200";
 
     return (
-      <span className={`px-2 py-1 rounded-lg text-xs border ${cls}`}>{label}</span>
+      <span className={`px-2 py-1 rounded-lg text-xs border ${cls}`}>
+        {label}
+      </span>
     );
   }
 
@@ -455,7 +565,11 @@ export default function Home() {
     return { label: "Low", tone: "bad" as const };
   }
 
-  function expectedMovePct(rangeLow: number, rangeHigh: number, lastClose: number) {
+  function expectedMovePct(
+    rangeLow: number,
+    rangeHigh: number,
+    lastClose: number
+  ) {
     const w = Math.max(0, rangeHigh - rangeLow);
     if (!lastClose || lastClose === 0) return 0;
     return (w / lastClose) * 100;
@@ -467,12 +581,14 @@ export default function Home() {
     return { label: "Low", tone: "good" as const };
   }
 
-  function marketBias(market: PredictResponse["market"]) {
+  function marketBias(market?: PredictResponse["market"]) {
     const spy = market?.SPY_ret_1 ?? 0;
     const qqq = market?.QQQ_ret_1 ?? 0;
     const avg = (spy + qqq) / 2;
-    if (avg > 0.15) return { label: "Risk-on", detail: "SPY/QQQ up", tone: "good" as const };
-    if (avg < -0.15) return { label: "Risk-off", detail: "SPY/QQQ down", tone: "bad" as const };
+    if (avg > 0.15)
+      return { label: "Risk-on", detail: "SPY/QQQ up", tone: "good" as const };
+    if (avg < -0.15)
+      return { label: "Risk-off", detail: "SPY/QQQ down", tone: "bad" as const };
     return { label: "Mixed", detail: "SPY/QQQ flat", tone: "neutral" as const };
   }
 
@@ -481,18 +597,24 @@ export default function Home() {
       <div className="max-w-5xl mx-auto p-6">
         <header className="flex flex-col gap-2">
           <h1 className="text-3xl font-semibold tracking-tight">
-            Stock Price Predictor
+            Market Predictor
           </h1>
           <p className="text-sm text-zinc-400 max-w-2xl">
-            Forecasting demo using free market data + baseline ML with market
-            context (SPY/QQQ). Not financial advice.
+            Forecasting demo using free market data + baseline ML. Stocks use
+            market context (SPY/QQQ). Crypto runs without SPY/QQQ context. Not
+            financial advice.
           </p>
+
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Backend: {backendOk === null ? "checking…" : backendOk ? "online" : "offline"}
+              Backend:{" "}
+              {backendOk === null ? "checking…" : backendOk ? "online" : "offline"}
             </span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Data: {pred?.source ?? "stooq"}
+              Asset: {assetType === "crypto" ? "crypto" : "stock"}
+            </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Data: {pred?.source ?? "—"}
             </span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Mode: {timeframe}
@@ -504,6 +626,7 @@ export default function Home() {
               Cache: {pred?.cache?.hit ? "hit" : pred ? "miss" : "—"}
             </span>
           </div>
+
           <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
             <span className="text-xs text-zinc-400">Live</span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-xs text-zinc-200">
@@ -551,6 +674,49 @@ export default function Home() {
           <div className="md:col-span-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-3 w-full">
+                {/* Asset Type toggle */}
+                <div className="flex rounded-xl border border-zinc-800 bg-zinc-950 overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAssetType("stock");
+                      const next = symbol.trim().toUpperCase();
+                      const pick = next || "AAPL";
+                      setSymbol(pick);
+                      setSymbolQuery(pick);
+                      setNewsTab("market");
+                    }}
+                    className={`px-3 py-3 text-xs font-medium transition ${
+                      assetType === "stock"
+                        ? "bg-zinc-100 text-zinc-900"
+                        : "text-zinc-300 hover:bg-zinc-900/50"
+                    }`}
+                    aria-pressed={assetType === "stock"}
+                  >
+                    Stocks
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAssetType("crypto");
+                      const next = symbol.trim().toUpperCase();
+                      const pick = next && next.length <= 6 ? next : "BTC";
+                      setSymbol(pick);
+                      setSymbolQuery(pick);
+                      setNewsTab("market");
+                      setBt(null);
+                    }}
+                    className={`px-3 py-3 text-xs font-medium transition ${
+                      assetType === "crypto"
+                        ? "bg-zinc-100 text-zinc-900"
+                        : "text-zinc-300 hover:bg-zinc-900/50"
+                    }`}
+                    aria-pressed={assetType === "crypto"}
+                  >
+                    Crypto
+                  </button>
+                </div>
+
                 <div className="relative flex-1">
                   <input
                     className="w-full rounded-xl bg-zinc-950 border border-zinc-800 px-4 py-3 outline-none focus:ring-2 focus:ring-zinc-600"
@@ -561,64 +727,137 @@ export default function Home() {
                     }}
                     onFocus={() => setComboOpen(true)}
                     onBlur={() => {
-                      // small delay so click selection works
                       setTimeout(() => setComboOpen(false), 150);
-                      // keep symbol in sync with what user typed (manual fallback)
                       setSymbol(symbolQuery.trim().toUpperCase());
                     }}
-                    placeholder={symbolsLoading ? "Loading S&P 500…" : "Search S&P 500 (e.g., Apple or AAPL)"}
+                    placeholder={
+                      assetType === "crypto"
+                        ? cryptoSymbolsLoading
+                          ? "Loading crypto…"
+                          : "Search crypto (e.g., BTC, ETH)"
+                        : symbolsLoading
+                        ? "Loading S&P 500…"
+                        : "Search S&P 500 (e.g., Apple or AAPL)"
+                    }
                     aria-label="Search ticker"
                   />
 
                   {comboOpen && (
                     <div className="absolute z-20 mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-950 shadow-lg overflow-hidden">
                       <div className="max-h-72 overflow-auto">
-                        {symbolsError ? (
-                          <div className="p-3 text-sm text-red-200">{symbolsError}</div>
-                        ) : symbolsLoading ? (
-                          <div className="p-3 text-sm text-zinc-400">Loading symbols…</div>
-                        ) : filteredSymbols.length === 0 ? (
-                          <div className="p-3 text-sm text-zinc-500">No matches. You can still type a ticker manually.</div>
-                        ) : (
-                          filteredSymbols.map((it) => (
-                            <button
-                              key={it.symbol}
-                              type="button"
-                              onMouseDown={(e) => e.preventDefault()}
-                              onClick={() => {
-                                // Prefer symbol_alt for providers that use '-' instead of '.'
-                                const pick = (it.symbol_alt ?? it.symbol).toUpperCase();
-                                setSymbol(pick);
-                                setSymbolQuery(pick);
-                                setComboOpen(false);
-                              }}
-                              className="w-full text-left px-4 py-3 hover:bg-zinc-900/60 border-b border-zinc-900/50 last:border-b-0"
-                            >
-                              <div className="flex items-center justify-between gap-3">
-                                <div className="min-w-0">
-                                  <div className="text-sm font-semibold text-zinc-100 truncate">
-                                    {it.symbol_alt ?? it.symbol}
-                                    <span className="ml-2 text-xs font-normal text-zinc-400 truncate">{it.name}</span>
+                        {assetType === "crypto" ? (
+                          cryptoSymbolsError ? (
+                            <div className="p-3 text-sm text-red-200">
+                              {cryptoSymbolsError}
+                            </div>
+                          ) : cryptoSymbolsLoading ? (
+                            <div className="p-3 text-sm text-zinc-400">
+                              Loading crypto…
+                            </div>
+                          ) : filteredSymbols.length === 0 ? (
+                            <div className="p-3 text-sm text-zinc-500">
+                              No matches. You can still type BTC, ETH, etc.
+                            </div>
+                          ) : (
+                            filteredSymbols.map((it: any) => {
+                              const displaySymbol = String(it.symbol ?? "").toUpperCase();
+                              const displayName = it.name ? String(it.name) : "Cryptocurrency";
+
+                              return (
+                                <button
+                                  key={displaySymbol}
+                                  type="button"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => {
+                                    setSymbol(displaySymbol);
+                                    setSymbolQuery(displaySymbol);
+                                    setComboOpen(false);
+                                  }}
+                                  className="w-full text-left px-4 py-3 hover:bg-zinc-900/60 border-b border-zinc-900/50 last:border-b-0"
+                                >
+                                  <div className="flex items-center justify-between gap-3">
+                                    <div className="min-w-0">
+                                      <div className="text-sm font-semibold text-zinc-100 truncate">
+                                        {displaySymbol}
+                                        <span className="ml-2 text-xs font-normal text-zinc-400 truncate">
+                                          {displayName}
+                                        </span>
+                                      </div>
+                                    </div>
+                                    <span className="text-xs text-zinc-400">
+                                      Select
+                                    </span>
                                   </div>
-                                  {it.sector ? (
-                                    <div className="mt-1 text-xs text-zinc-500 truncate">{it.sector}</div>
-                                  ) : null}
+                                </button>
+                              );
+                            })
+                          )
+                        ) : symbolsError ? (
+                          <div className="p-3 text-sm text-red-200">
+                            {symbolsError}
+                          </div>
+                        ) : symbolsLoading ? (
+                          <div className="p-3 text-sm text-zinc-400">
+                            Loading symbols…
+                          </div>
+                        ) : filteredSymbols.length === 0 ? (
+                          <div className="p-3 text-sm text-zinc-500">
+                            No matches. You can still type a ticker manually.
+                          </div>
+                        ) : (
+                          filteredSymbols.map((it: any) => {
+                            const displaySymbol = String((it.symbol_alt ?? it.symbol) ?? "").toUpperCase();
+                            const displayName = String(it.name ?? "");
+                            const displayMeta = it.sector ? String(it.sector) : null;
+
+                            return (
+                              <button
+                                key={displaySymbol}
+                                type="button"
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => {
+                                  setSymbol(displaySymbol);
+                                  setSymbolQuery(displaySymbol);
+                                  setComboOpen(false);
+                                }}
+                                className="w-full text-left px-4 py-3 hover:bg-zinc-900/60 border-b border-zinc-900/50 last:border-b-0"
+                              >
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <div className="text-sm font-semibold text-zinc-100 truncate">
+                                      {displaySymbol}
+                                      <span className="ml-2 text-xs font-normal text-zinc-400 truncate">
+                                        {displayName}
+                                      </span>
+                                    </div>
+                                    {displayMeta ? (
+                                      <div className="mt-1 text-xs text-zinc-500 truncate">{displayMeta}</div>
+                                    ) : null}
+                                  </div>
+                                  <span className="text-xs text-zinc-400">
+                                    Select
+                                  </span>
                                 </div>
-                                <span className="text-xs text-zinc-400">Select</span>
-                              </div>
-                            </button>
-                          ))
+                              </button>
+                            );
+                          })
                         )}
                       </div>
                     </div>
                   )}
 
                   <div className="mt-1 text-[11px] text-zinc-500">
-                    {symbolsLoading
+                    {assetType === "crypto"
+                      ? cryptoSymbolsLoading
+                        ? "Loading crypto…"
+                        : cryptoSymbolsError
+                        ? "Crypto symbols failed to load — you can still type BTC, ETH, etc."
+                        : `Loaded ${cryptoSymbols.length} crypto symbols.`
+                      : symbolsLoading
                       ? "Loading symbols…"
                       : symbolsError
-                        ? "Symbols failed to load — you can still type any ticker manually."
-                        : `Loaded ${symbols.length} S&P 500 symbols. Search by name or ticker.`}
+                      ? "Symbols failed to load — you can still type any ticker manually."
+                      : `Loaded ${symbols.length} S&P 500 symbols. Search by name or ticker.`}
                   </div>
                 </div>
 
@@ -679,18 +918,29 @@ export default function Home() {
                 <>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Last close</div>
-                    <div className="mt-1 text-lg font-semibold">${fmtMoney(pred.last_close)}</div>
+                    <div className="mt-1 text-lg font-semibold">
+                      ${fmtMoney(pred.last_close)}
+                    </div>
                   </div>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Predicted next</div>
-                    <div className="mt-1 text-lg font-semibold">${fmtMoney(pred.prediction)}</div>
+                    <div className="mt-1 text-lg font-semibold">
+                      ${fmtMoney(pred.prediction)}
+                    </div>
                   </div>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Change</div>
                     <div className="mt-1 text-lg font-semibold">
-                      {changePct === null ? "—" : (
-                        <span className={changePct >= 0 ? "text-emerald-200" : "text-red-200"}>
-                          {changePct >= 0 ? "+" : ""}{changePct.toFixed(2)}%
+                      {changePct === null ? (
+                        "—"
+                      ) : (
+                        <span
+                          className={
+                            changePct >= 0 ? "text-emerald-200" : "text-red-200"
+                          }
+                        >
+                          {changePct >= 0 ? "+" : ""}
+                          {changePct.toFixed(2)}%
                         </span>
                       )}
                     </div>
@@ -714,32 +964,40 @@ export default function Home() {
                 </div>
               )}
             </div>
+
             {/* Market context row */}
-            <div className="mt-4 flex flex-wrap gap-2 text-xs text-zinc-300">
-              <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
-                Market context:
-              </span>
-              {pred ? (
-                <>
-                  <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
-                    SPY {badgeForPct(pred.market.SPY_ret_1)}
-                  </span>
-                  <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
-                    QQQ {badgeForPct(pred.market.QQQ_ret_1)}
-                  </span>
-                  {pred.cache?.ttl_sec ? (
-                    <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-400">
-                      Cached: {pred.cache.hit ? "yes" : "no"} (TTL{" "}
-                      {pred.cache.ttl_sec}s)
-                    </span>
-                  ) : null}
-                </>
-              ) : (
-                <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-500">
-                  run prediction to load
+            {assetType === "stock" ? (
+              <div className="mt-4 flex flex-wrap gap-2 text-xs text-zinc-300">
+                <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                  Market context:
                 </span>
-              )}
-            </div>
+
+                {pred?.market ? (
+                  <>
+                    <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                      SPY {badgeForPct(pred.market.SPY_ret_1)}
+                    </span>
+                    <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                      QQQ {badgeForPct(pred.market.QQQ_ret_1)}
+                    </span>
+                    {pred.cache?.ttl_sec ? (
+                      <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-400">
+                        Cached: {pred.cache.hit ? "yes" : "no"} (TTL{" "}
+                        {pred.cache.ttl_sec}s)
+                      </span>
+                    ) : null}
+                  </>
+                ) : (
+                  <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-500">
+                    run prediction to load
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div className="mt-4 text-xs text-zinc-500">
+                Crypto mode: no SPY/QQQ market context.
+              </div>
+            )}
 
             <div className="mt-4 h-[340px] min-w-0 w-full rounded-2xl border border-zinc-800 bg-zinc-950 p-3">
               {candles.length === 0 ? (
@@ -799,23 +1057,27 @@ export default function Home() {
 
                 {/* Multi-horizon forecast */}
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
-                  <div className="text-xs text-zinc-500">Multi-horizon forecast</div>
+                  <div className="text-xs text-zinc-500">
+                    Multi-horizon forecast
+                  </div>
                   {!forecast || forecast.horizons.length === 0 ? (
-                    <div className="mt-2 text-sm text-zinc-500">Forecast not available.</div>
+                    <div className="mt-2 text-sm text-zinc-500">
+                      Forecast not available.
+                    </div>
                   ) : (
                     <div className="mt-3 grid grid-cols-1 gap-2">
                       {forecast.horizons.map((it) => {
                         const label =
-                          timeframe === "daily"
-                            ? `${it.horizon}D`
-                            : `${it.horizon}W`;
+                          timeframe === "daily" ? `${it.horizon}D` : `${it.horizon}W`;
                         return (
                           <div
                             key={it.horizon}
                             className="flex items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-900/20 px-3 py-2"
                           >
                             <div className="flex items-center gap-2">
-                              <span className="text-xs text-zinc-400 w-10">{label}</span>
+                              <span className="text-xs text-zinc-400 w-10">
+                                {label}
+                              </span>
                               <span className="text-sm font-semibold text-zinc-100">
                                 ${fmtMoney(it.prediction)}
                               </span>
@@ -823,8 +1085,15 @@ export default function Home() {
                                 (${fmtMoney(it.range_low)}–${fmtMoney(it.range_high)})
                               </span>
                             </div>
-                            <span className={it.change_pct >= 0 ? "text-xs text-emerald-200" : "text-xs text-red-200"}>
-                              {it.change_pct >= 0 ? "+" : ""}{it.change_pct.toFixed(2)}%
+                            <span
+                              className={
+                                it.change_pct >= 0
+                                  ? "text-xs text-emerald-200"
+                                  : "text-xs text-red-200"
+                              }
+                            >
+                              {it.change_pct >= 0 ? "+" : ""}
+                              {it.change_pct.toFixed(2)}%
                             </span>
                           </div>
                         );
@@ -852,7 +1121,9 @@ export default function Home() {
                 {/* Prediction Breakdown */}
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="flex items-center justify-between gap-3">
-                    <div className="text-xs text-zinc-500">Prediction Breakdown</div>
+                    <div className="text-xs text-zinc-500">
+                      Prediction Breakdown
+                    </div>
                     {(() => {
                       const c = confidenceLabel(pred.confidence);
                       return toneBadge(`${c.label} confidence`, c.tone);
@@ -864,7 +1135,10 @@ export default function Home() {
                       const dir = pred.prediction - pred.last_close;
                       const pct = (dir / pred.last_close) * 100;
                       const tone = pctTone(pct);
-                      const label = pct >= 0 ? `Bullish (${pct.toFixed(2)}%)` : `Bearish (${pct.toFixed(2)}%)`;
+                      const label =
+                        pct >= 0
+                          ? `Bullish (${pct.toFixed(2)}%)`
+                          : `Bearish (${pct.toFixed(2)}%)`;
                       return (
                         <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                           <div className="text-[11px] text-zinc-500">Direction</div>
@@ -873,21 +1147,34 @@ export default function Home() {
                       );
                     })()}
 
-                    {(() => {
-                      const bias = marketBias(pred.market);
-                      return (
-                        <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                          <div className="text-[11px] text-zinc-500">Market mood</div>
-                          <div className="mt-1 flex flex-wrap items-center gap-2">
-                            {toneBadge(bias.label, bias.tone)}
-                            <span className="text-[11px] text-zinc-500">{bias.detail}</span>
+                    {assetType === "stock" ? (
+                      (() => {
+                        const bias = marketBias(pred.market);
+                        return (
+                          <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                            <div className="text-[11px] text-zinc-500">Market mood</div>
+                            <div className="mt-1 flex flex-wrap items-center gap-2">
+                              {toneBadge(bias.label, bias.tone)}
+                              <span className="text-[11px] text-zinc-500">{bias.detail}</span>
+                            </div>
                           </div>
+                        );
+                      })()
+                    ) : (
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">Market mood</div>
+                        <div className="mt-1 text-[11px] text-zinc-500">
+                          Crypto mode (no SPY/QQQ)
                         </div>
-                      );
-                    })()}
+                      </div>
+                    )}
 
                     {(() => {
-                      const mv = expectedMovePct(pred.range_low, pred.range_high, pred.last_close);
+                      const mv = expectedMovePct(
+                        pred.range_low,
+                        pred.range_high,
+                        pred.last_close
+                      );
                       const r = riskLabelFromMove(mv);
                       return (
                         <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
@@ -903,34 +1190,50 @@ export default function Home() {
                     <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                       <div className="text-[11px] text-zinc-500">Key inputs</div>
                       <div className="mt-1 flex flex-wrap gap-2 text-xs">
-                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">Price history</span>
-                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">Volume</span>
-                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">SPY</span>
-                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">QQQ</span>
+                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">
+                          Price history
+                        </span>
+                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">
+                          Volume
+                        </span>
+                        {assetType === "stock" ? (
+                          <>
+                            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">
+                              SPY
+                            </span>
+                            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">
+                              QQQ
+                            </span>
+                          </>
+                        ) : null}
                       </div>
                     </div>
                   </div>
 
                   <p className="mt-3 text-[11px] text-zinc-500 leading-relaxed">
-                    This breakdown is a simple explanation based on model inputs (market context + recent price behavior). It helps interpret the output,
-                    but it does not prove causation.
+                    This breakdown is a simple explanation based on model inputs. It helps
+                    interpret the output, but it does not prove causation.
                   </p>
                 </div>
 
-                {/* Accuracy / Backtest */}
+                {/* Accuracy / Backtest (stocks only) */}
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <div className="text-xs text-zinc-500">Accuracy (walk-forward backtest)</div>
+                      <div className="text-xs text-zinc-500">
+                        Accuracy (walk-forward backtest)
+                      </div>
                       <div className="mt-1 text-[11px] text-zinc-600">
-                        Auto cached daily • Use “Rerun now” for a fresh (slower) test
+                        {assetType === "crypto"
+                          ? "Crypto backtest disabled."
+                          : "Auto cached daily • Use “Rerun now” for a fresh (slower) test"}
                       </div>
                     </div>
                     <div className="flex gap-2">
                       <button
                         type="button"
                         onClick={() => runBacktest(false)}
-                        disabled={btLoading}
+                        disabled={btLoading || assetType === "crypto"}
                         className="rounded-xl px-3 py-1.5 bg-zinc-100 text-zinc-900 text-xs font-medium hover:bg-white disabled:opacity-60"
                         title="Fetch cached backtest (daily)"
                       >
@@ -939,7 +1242,7 @@ export default function Home() {
                       <button
                         type="button"
                         onClick={() => runBacktest(true)}
-                        disabled={btLoading}
+                        disabled={btLoading || assetType === "crypto"}
                         className="rounded-xl px-3 py-1.5 border border-zinc-700 bg-zinc-900/40 text-xs text-zinc-200 hover:bg-zinc-900 disabled:opacity-60"
                         title="Force recompute now (slower)"
                       >
@@ -952,7 +1255,11 @@ export default function Home() {
                     <div className="mt-3 text-sm text-red-200">{btError}</div>
                   ) : null}
 
-                  {!bt ? (
+                  {assetType === "crypto" ? (
+                    <div className="mt-3 text-sm text-zinc-500">
+                      Backtest is currently stock-only.
+                    </div>
+                  ) : !bt ? (
                     <div className="mt-3 text-sm text-zinc-500">
                       Run Predict (or Evaluate) to see historical accuracy.
                     </div>
@@ -972,11 +1279,15 @@ export default function Home() {
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                         <div className="text-[11px] text-zinc-500">MAE</div>
-                        <div className="mt-1 text-sm font-semibold">${fmtMoney(bt.metrics.mae ?? 0)}</div>
+                        <div className="mt-1 text-sm font-semibold">
+                          ${fmtMoney(bt.metrics.mae ?? 0)}
+                        </div>
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                         <div className="text-[11px] text-zinc-500">Test points</div>
-                        <div className="mt-1 text-sm font-semibold">{bt.metrics.points ?? "—"}</div>
+                        <div className="mt-1 text-sm font-semibold">
+                          {bt.metrics.points ?? "—"}
+                        </div>
                       </div>
                       <div className="col-span-2 mt-1 text-[11px] text-zinc-500">
                         As of {bt.as_of} • Cache bucket {bt.day_bucket}
@@ -990,9 +1301,11 @@ export default function Home() {
                 </div>
 
                 <div className="text-xs text-zinc-500">
-                  Model: RandomForest baseline (with SPY/QQQ context) • Trained on{" "}
-                  {pred.data_points} candles
+                  {assetType === "crypto"
+                    ? `Model: Baseline ML • Trained on ${pred.data_points} candles`
+                    : `Model: RandomForest baseline (with SPY/QQQ context) • Trained on ${pred.data_points} candles`}
                 </div>
+
                 <details className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <summary className="cursor-pointer text-sm text-zinc-200 select-none">
                     About this prediction
@@ -1000,23 +1313,24 @@ export default function Home() {
                   <div className="mt-3 space-y-3 text-sm text-zinc-400">
                     <p>
                       This is a demo model trained on historical candles using technical features
-                      (returns, moving averages, volatility, volume signals) plus market context
-                      from SPY and QQQ.
+                      (returns, moving averages, volatility, volume signals).
+                      {assetType === "stock"
+                        ? " Stocks also include market context from SPY and QQQ."
+                        : " Crypto runs without SPY/QQQ market context."}
                     </p>
                     <ul className="space-y-1">
-                      <li>• Daily = next trading day close</li>
+                      <li>• Daily = next period close</li>
                       <li>• Weekly = next weekly close (aggregated candles)</li>
                       <li>• Confidence is a rough stability score, not a guarantee</li>
                     </ul>
-                    <p className="text-xs text-zinc-500">
-                      Not financial advice.
-                    </p>
+                    <p className="text-xs text-zinc-500">Not financial advice.</p>
                   </div>
                 </details>
               </div>
             )}
           </div>
         </section>
+
         {/* News */}
         <section className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -1039,14 +1353,22 @@ export default function Home() {
                 Market
               </button>
               <button
-                onClick={() => setNewsTab("ticker")}
+                onClick={() => {
+                  if (assetType === "crypto") {
+                    setNewsTab("market");
+                    return;
+                  }
+                  setNewsTab("ticker");
+                }}
                 className={`px-3 py-1.5 rounded-lg text-xs border transition ${
                   newsTab === "ticker"
                     ? "border-zinc-600 bg-zinc-950 text-zinc-100"
                     : "border-zinc-800 bg-zinc-900/30 text-zinc-400 hover:text-zinc-200"
                 }`}
               >
-                {symbol.trim().toUpperCase() || "Ticker"}
+                {assetType === "crypto"
+                  ? "Ticker (disabled)"
+                  : symbol.trim().toUpperCase() || "Ticker"}
               </button>
             </div>
           </div>
@@ -1062,7 +1384,10 @@ export default function Home() {
               {newsLoading ? (
                 <>
                   {[0, 1, 2].map((k) => (
-                    <div key={k} className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+                    <div
+                      key={k}
+                      className="rounded-xl border border-zinc-800 bg-zinc-950 p-4"
+                    >
                       <Skeleton className="h-4 w-40" />
                       <Skeleton className="mt-3 h-4 w-full" />
                       <Skeleton className="mt-2 h-4 w-5/6" />
