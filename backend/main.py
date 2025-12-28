@@ -1,7 +1,8 @@
+from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, Optional, Literal, List
 import pandas as pd
 import numpy as np
 import requests
@@ -12,7 +13,19 @@ import time
 # News endpoint imports
 import os
 import hashlib
+import json
 from datetime import datetime
+
+# ----------------------------
+# Optional PyTorch (safe import)
+# ----------------------------
+TORCH_AVAILABLE = False
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
 
 
 app = FastAPI(title="Stock Predictor API")
@@ -27,12 +40,35 @@ app.add_middleware(
 )
 
 # ----------------------------
+# Storage (models + bias)
+# ----------------------------
+MODEL_DIR = os.getenv("MODEL_DIR", "./model_store")
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+def _safe_sym_tf(symbol: str, tf: str) -> str:
+    return f"{symbol.upper().strip()}_{tf.lower().strip()}"
+
+def _model_path(symbol: str, tf: str, model_type: str) -> str:
+    key = _safe_sym_tf(symbol, tf)
+    return os.path.join(MODEL_DIR, f"{key}_{model_type}.pkl")
+
+def _torch_path(symbol: str, tf: str) -> str:
+    key = _safe_sym_tf(symbol, tf)
+    return os.path.join(MODEL_DIR, f"{key}_torch.pt")
+
+def _bias_path(symbol: str, tf: str) -> str:
+    key = _safe_sym_tf(symbol, tf)
+    return os.path.join(MODEL_DIR, f"{key}_bias.json")
+
+
+# ----------------------------
 # Simple in-memory cache (MVP)
 # ----------------------------
 PRED_CACHE_TTL_SEC = 15 * 60  # 15 minutes
 HIST_CACHE_TTL_SEC = 15 * 60
 _pred_cache: dict[str, tuple[float, dict]] = {}
 _hist_cache: dict[str, tuple[float, dict]] = {}
+
 # Forecast cache: multi-horizon forecasts
 FORECAST_CACHE_TTL_SEC = 15 * 60  # 15 minutes
 _forecast_cache: dict[str, tuple[float, dict]] = {}
@@ -44,8 +80,12 @@ _data_cache: dict[str, tuple[float, pd.DataFrame]] = {}
 # Model cache: avoid retraining if the latest candle hasn't changed
 MODEL_CACHE_TTL_SEC = 60 * 60  # 1 hour
 _model_cache: dict[str, tuple[float, Any]] = {}
-# stored value: {"model": fitted_model, "last_date": "YYYY-MM-DD", "feature_cols": [...]} 
+# stored value: {"model": fitted_model, "last_date": "YYYY-MM-DD", "feature_cols": [...], "model_type": "rf"|"torch"} 
 
+# Bias cache: fast “learn from mistakes” adjustment
+BIAS_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
+_bias_cache: dict[str, tuple[float, Any]] = {}
+# stored value: {"bias": float, "updated_at": "...", "alpha": float, "last_date_key": "..."} 
 
 # Tune cache: avoid re-running backtests constantly
 TUNE_CACHE_TTL_SEC = 6 * 60 * 60  # 6 hours
@@ -66,18 +106,24 @@ _news_cache: dict[str, tuple[float, dict]] = {}
 SYMBOLS_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
 _symbols_cache: dict[str, tuple[float, dict]] = {}
 
+# Default model type (can override per request)
+DEFAULT_MODEL_TYPE = os.getenv("MODEL_TYPE", "rf").strip().lower()
+if DEFAULT_MODEL_TYPE not in ("rf", "torch"):
+    DEFAULT_MODEL_TYPE = "rf"
 
 
+# ----------------------------
+# Request models
+# ----------------------------
 class PredictRequest(BaseModel):
     symbol: str
     timeframe: str = "daily"  # "daily" or "weekly"
-
+    model: Optional[Literal["rf", "torch"]] = None  # optional override
 
 class ForecastRequest(BaseModel):
     symbol: str
     timeframe: str = "daily"  # "daily" or "weekly"
-    horizons: list[int] | None = None  # e.g. [1,3,5]
-
+    horizons: Optional[List[int]] = None  # e.g. [1,3,5]
 
 def normalize_timeframe(tf: str) -> str:
     tf = (tf or "").strip().lower()
@@ -85,25 +131,23 @@ def normalize_timeframe(tf: str) -> str:
         raise HTTPException(status_code=400, detail="timeframe must be daily or weekly")
     return tf
 
-
 def default_horizons(tf: str) -> list[int]:
-    # Keep it small (fast + understandable)
     return [1, 3, 5] if tf == "daily" else [1, 2, 4]
-
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
+# ----------------------------
+# Features
+# ----------------------------
 def get_feature_cols() -> list[str]:
-    # Must match columns produced by make_features_with_market()
     return [
         "ret_1", "ret_5", "ma_5", "ma_10", "vol_10", "volume_ma_10",
         "spy_ret_1", "qqq_ret_1", "rel_spy_1", "rel_qqq_1", "corr_spy_20",
     ]
 
-
-def build_rf(params: dict | None = None) -> RandomForestRegressor:
+def build_rf(params: Optional[dict] = None) -> RandomForestRegressor:
     p = params or {}
     return RandomForestRegressor(
         n_estimators=int(p.get("n_estimators", 180)),
@@ -115,16 +159,126 @@ def build_rf(params: dict | None = None) -> RandomForestRegressor:
     )
 
 
+# ----------------------------
+# PyTorch model (small MLP regressor)
+# ----------------------------
+class TorchMLP(nn.Module):
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+def _torch_train_and_fit(X: np.ndarray, y: np.ndarray, epochs: int = 60, lr: float = 1e-3) -> Any:
+    """Train a tiny MLP quickly on CPU. Returns dict with model + normalization."""
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("torch_not_installed")
+
+    device = torch.device("cpu")
+
+    X = X.astype(np.float32)
+    y = y.astype(np.float32).reshape(-1, 1)
+
+    # normalize features
+    mu = X.mean(axis=0)
+    sig = X.std(axis=0)
+    sig = np.where(sig < 1e-8, 1.0, sig)
+    Xn = (X - mu) / sig
+
+    model = TorchMLP(in_dim=Xn.shape[1]).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.SmoothL1Loss()
+
+    xb = torch.from_numpy(Xn).to(device)
+    yb = torch.from_numpy(y).to(device)
+
+    model.train()
+    for _ in range(int(epochs)):
+        opt.zero_grad()
+        pred = model(xb)
+        loss = loss_fn(pred, yb)
+        loss.backward()
+        opt.step()
+
+    return {"model": model, "mu": mu, "sig": sig}
+
+def _torch_predict(fit_obj: Any, x: np.ndarray) -> float:
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("torch_not_installed")
+    model: nn.Module = fit_obj["model"]
+    mu = fit_obj["mu"]
+    sig = fit_obj["sig"]
+    x = x.astype(np.float32).reshape(1, -1)
+    xn = (x - mu) / sig
+    with torch.no_grad():
+        model.eval()
+        out = model(torch.from_numpy(xn)).cpu().numpy().reshape(-1)[0]
+    return float(out)
+
+def _torch_save(fit_obj: Any, path: str, meta: dict):
+    """Save torch weights + normalization + meta."""
+    if not TORCH_AVAILABLE:
+        return
+    payload = {
+        "state_dict": fit_obj["model"].state_dict(),
+        "mu": fit_obj["mu"],
+        "sig": fit_obj["sig"],
+        "meta": meta,
+    }
+    torch.save(payload, path)
+
+def _torch_load(path: str) -> Optional[Any]:
+    if not TORCH_AVAILABLE:
+        return None
+    if not os.path.exists(path):
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu")
+        mu = payload["mu"]
+        sig = payload["sig"]
+        meta = payload.get("meta") or {}
+        in_dim = int(len(mu))
+        model = TorchMLP(in_dim=in_dim)
+        model.load_state_dict(payload["state_dict"])
+        return {"model": model, "mu": mu, "sig": sig, "meta": meta}
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Cache helpers
+# ----------------------------
+def cache_get(cache: dict, key: str, ttl: int):
+    now = time.time()
+    if key in cache:
+        ts, val = cache[key]
+        if (now - ts) < ttl:
+            return val
+        else:
+            del cache[key]
+    return None
+
+def cache_set(cache: dict, key: str, val: Any):
+    cache[key] = (time.time(), val)
+
+def _date_key_today_utc() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+# ----------------------------
+# Data fetching
+# ----------------------------
 def fetch_stooq_ohlcv(symbol: str) -> pd.DataFrame:
-    """
-    Fetch DAILY OHLCV data from Stooq (free, no API key).
-    Returns columns: Date, Open, High, Low, Close, Volume
-    """
-    # Cache by symbol for a short time so repeat requests are fast
     cache_key = f"stooq:{symbol.lower().strip()}:daily"
     cached = cache_get(_data_cache, cache_key, DATA_CACHE_TTL_SEC)
     if cached is not None:
-        # return a copy so callers can safely modify
         return cached.copy()
 
     s = symbol.lower().strip()
@@ -147,11 +301,7 @@ def fetch_stooq_ohlcv(symbol: str) -> pd.DataFrame:
     cache_set(_data_cache, cache_key, df)
     return df
 
-
 def to_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert DAILY OHLCV data into WEEKLY candles.
-    """
     weekly = (
         df.set_index("Date")
           .resample("W-FRI")
@@ -167,31 +317,21 @@ def to_weekly(df: pd.DataFrame) -> pd.DataFrame:
     )
     return weekly
 
-
 def get_symbol_df(symbol: str, tf: str) -> pd.DataFrame:
     df = fetch_stooq_ohlcv(symbol)
     if tf == "weekly":
         df = to_weekly(df)
     return df
 
-
 def make_features_with_market(stock_df: pd.DataFrame, spy_df: pd.DataFrame, qqq_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build features for the stock, plus market context (SPY, QQQ).
-    Predict next period close.
-    """
     s = stock_df[["Date", "Open", "High", "Low", "Close", "Volume"]].copy()
     spy = spy_df[["Date", "Close"]].rename(columns={"Close": "SPY_Close"})
     qqq = qqq_df[["Date", "Close"]].rename(columns={"Close": "QQQ_Close"})
 
-    # Merge on Date
     out = s.merge(spy, on="Date", how="left").merge(qqq, on="Date", how="left")
-
-    # Forward fill in case of missing market rows (holidays/data gaps)
     out["SPY_Close"] = out["SPY_Close"].ffill()
     out["QQQ_Close"] = out["QQQ_Close"].ffill()
 
-    # Basic stock features
     out["ret_1"] = out["Close"].pct_change(1)
     out["ret_5"] = out["Close"].pct_change(5)
     out["ma_5"] = out["Close"].rolling(5).mean()
@@ -199,20 +339,15 @@ def make_features_with_market(stock_df: pd.DataFrame, spy_df: pd.DataFrame, qqq_
     out["vol_10"] = out["Close"].rolling(10).std()
     out["volume_ma_10"] = out["Volume"].rolling(10).mean()
 
-    # Market features
     out["spy_ret_1"] = out["SPY_Close"].pct_change(1)
     out["qqq_ret_1"] = out["QQQ_Close"].pct_change(1)
 
-    # Relative strength features (stock minus market)
     out["rel_spy_1"] = out["ret_1"] - out["spy_ret_1"]
     out["rel_qqq_1"] = out["ret_1"] - out["qqq_ret_1"]
 
-    # Rolling correlation to SPY (how “market-driven” it’s been)
     out["corr_spy_20"] = out["ret_1"].rolling(20).corr(out["spy_ret_1"])
 
-    # Target = next period close
     out["target_next_close"] = out["Close"].shift(-1)
-
     out = out.dropna().reset_index(drop=True)
     return out
 
@@ -220,7 +355,6 @@ def make_features_with_market(stock_df: pd.DataFrame, spy_df: pd.DataFrame, qqq_
 # ----------------------------
 # Backtest + tuning (Option A)
 # ----------------------------
-
 def _walk_forward_backtest(
     feat: pd.DataFrame,
     feature_cols: list[str],
@@ -229,12 +363,6 @@ def _walk_forward_backtest(
     max_test_points: int = 50,
     retrain_every: int = 5,
 ) -> dict[str, Any]:
-    """Expanding-window walk-forward backtest (fast).
-
-    To keep it fast:
-      - evaluates only the most recent `max_test_points` steps
-      - retrains only every `retrain_every` steps
-    """
     n = len(feat)
     if n < 120:
         return {"ok": False, "reason": "not_enough_data"}
@@ -289,9 +417,7 @@ def _walk_forward_backtest(
         "direction_accuracy": dir_acc,
     }
 
-
 def _tune_params_for_symbol(feat: pd.DataFrame, feature_cols: list[str]) -> dict[str, Any]:
-    """Try a small param grid and pick best by MAPE (then MAE)."""
     grid = [
         {"n_estimators": 120, "max_depth": 10, "min_samples_leaf": 2, "max_features": "sqrt"},
         {"n_estimators": 160, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"},
@@ -322,42 +448,106 @@ def _tune_params_for_symbol(feat: pd.DataFrame, feature_cols: list[str]) -> dict
             "backtest": {"ok": False, "reason": "tune_failed"},
         }
 
-    return {
-        "params": best["params"],
-        "backtest": best["backtest"],
-    }
+    return {"params": best["params"], "backtest": best["backtest"]}
 
 
-def cache_get(cache: dict, key: str, ttl: int):
-    now = time.time()
-    if key in cache:
-        ts, val = cache[key]
-        if (now - ts) < ttl:
-            return val
+# ----------------------------
+# Bias “learning” (fast)
+# ----------------------------
+def _load_bias(symbol: str, tf: str) -> dict[str, Any]:
+    key = f"bias:{symbol}:{tf}"
+    cached = cache_get(_bias_cache, key, BIAS_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
+    path = _bias_path(symbol, tf)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict) and "bias" in obj:
+                cache_set(_bias_cache, key, obj)
+                return obj
+        except Exception:
+            pass
+
+    obj = {"bias": 0.0, "alpha": 0.20, "updated_at": None, "last_date_key": None}
+    cache_set(_bias_cache, key, obj)
+    return obj
+
+def _save_bias(symbol: str, tf: str, obj: dict[str, Any]) -> None:
+    key = f"bias:{symbol}:{tf}"
+    cache_set(_bias_cache, key, obj)
+    try:
+        with open(_bias_path(symbol, tf), "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+def _update_bias_from_latest_known(
+    symbol: str,
+    tf: str,
+    feat: pd.DataFrame,
+    feature_cols: list[str],
+    model_type: str,
+    model_obj: Any,
+    last_date_key: str,
+) -> dict[str, Any]:
+    """
+    Update bias using a *known* target:
+    Use second-last feature row to predict its next_close (= last close),
+    then compare to actual last close, update EMA bias.
+    """
+    if len(feat) < 5:
+        return _load_bias(symbol, tf)
+
+    bias_obj = _load_bias(symbol, tf)
+    if bias_obj.get("last_date_key") == last_date_key:
+        return bias_obj  # already updated for this latest candle
+
+    # second-last row predicts last close
+    row = feat.iloc[-2]
+    true_next = float(row["target_next_close"])
+
+    x = row[feature_cols].values.astype(float)
+
+    try:
+        if model_type == "torch":
+            pred_next = float(_torch_predict(model_obj, x))
         else:
-            del cache[key]
-    return None
+            pred_next = float(model_obj.predict(x.reshape(1, -1))[0])
+    except Exception:
+        return bias_obj
+
+    err = true_next - pred_next  # positive => model too low
+    alpha = float(bias_obj.get("alpha", 0.20))
+    old_bias = float(bias_obj.get("bias", 0.0))
+    new_bias = (1 - alpha) * old_bias + alpha * err
+
+    bias_obj = {
+        "bias": float(new_bias),
+        "alpha": alpha,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "last_date_key": last_date_key,
+        "last_err": float(err),
+    }
+    _save_bias(symbol, tf, bias_obj)
+    return bias_obj
 
 
-def cache_set(cache: dict, key: str, val: Any):
-    cache[key] = (time.time(), val)
-
-def _date_key_today_utc() -> str:
-    # Daily cache bucket
-    return datetime.utcnow().strftime("%Y-%m-%d")
-
-
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/health")
 def health():
-    return {"ok": True}
-
+    return {
+        "ok": True,
+        "torch_available": TORCH_AVAILABLE,
+        "default_model": DEFAULT_MODEL_TYPE,
+    }
 
 @app.get("/history/{symbol}")
 def history(symbol: str, timeframe: str = "daily", points: int = 200):
-    """
-    Returns OHLCV candles for charting.
-    Cached for speed.
-    """
     symbol = symbol.upper().strip()
     if not symbol.isalnum():
         raise HTTPException(status_code=400, detail="Symbol must be letters/numbers only")
@@ -370,7 +560,6 @@ def history(symbol: str, timeframe: str = "daily", points: int = 200):
         return cached
 
     df = get_symbol_df(symbol, tf)
-
     if len(df) < 30:
         raise HTTPException(status_code=400, detail="Not enough history")
 
@@ -397,19 +586,20 @@ def history(symbol: str, timeframe: str = "daily", points: int = 200):
 
 @app.post("/predict")
 def predict(req: PredictRequest):
-    """
-    Prediction with market context:
-    - Fetch stock + SPY + QQQ from Stooq
-    - Build features (stock indicators + market indicators)
-    - Train baseline model
-    - Cache the result for 15 minutes
-    """
     symbol = req.symbol.upper().strip()
     if not symbol.isalnum():
         raise HTTPException(status_code=400, detail="Symbol must be letters/numbers only (e.g., AAPL)")
 
     tf = normalize_timeframe(req.timeframe)
-    cache_key = f"{symbol}:{tf}"
+
+    requested_model = (req.model or DEFAULT_MODEL_TYPE).strip().lower()
+    if requested_model not in ("rf", "torch"):
+        requested_model = "rf"
+    if requested_model == "torch" and not TORCH_AVAILABLE:
+        requested_model = "rf"  # auto fallback
+
+    # cache key includes model type so switching doesn't clash
+    cache_key = f"{symbol}:{tf}:{requested_model}"
 
     cached = cache_get(_pred_cache, cache_key, PRED_CACHE_TTL_SEC)
     if cached is not None:
@@ -418,7 +608,6 @@ def predict(req: PredictRequest):
     # Fetch data
     stock_df = get_symbol_df(symbol, tf)
 
-    # Latest date key (used for model/tune caching)
     last_date = stock_df["Date"].iloc[-1]
     last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
 
@@ -429,18 +618,15 @@ def predict(req: PredictRequest):
         raise HTTPException(status_code=400, detail="Not enough history to model")
 
     feat = make_features_with_market(stock_df, spy_df, qqq_df)
-
-    # Keep computations fast: use a recent window of feature rows
     feat = feat.tail(600).reset_index(drop=True)
 
     feature_cols = get_feature_cols()
 
-    # Optional: expensive backtest/tuning (disabled by default for speed)
     tuned_params = None
     bt_summary = None
     tune_cache_hit = False
 
-    if ENABLE_TUNING:
+    if ENABLE_TUNING and requested_model == "rf":
         tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
         tuned = cache_get(_tune_cache, tune_key, TUNE_CACHE_TTL_SEC)
         tune_cache_hit = tuned is not None
@@ -451,50 +637,91 @@ def predict(req: PredictRequest):
         tuned_params = tuned.get("params") if isinstance(tuned, dict) else None
         bt_summary = tuned.get("backtest") if isinstance(tuned, dict) else None
 
-    X = feat[feature_cols].values
-    y = feat["target_next_close"].values
+    X = feat[feature_cols].values.astype(float)
+    y = feat["target_next_close"].values.astype(float)
 
-    # If we already trained a model for this (symbol, timeframe) and the latest candle
-    # hasn't changed, reuse the model to make prediction instant.
-    model_key = f"model:{symbol}:{tf}"
+    # --- Model caching (RAM) ---
+    model_key = f"model:{symbol}:{tf}:{requested_model}"
     model_cached = cache_get(_model_cache, model_key, MODEL_CACHE_TTL_SEC)
 
     model_cache_hit = False
-    if isinstance(model_cached, dict) and model_cached.get("last_date") == last_date_key:
-        model = model_cached.get("model")
-        model_cache_hit = model is not None
-    else:
-        model = None
+    model_obj = None
 
+    if isinstance(model_cached, dict) and model_cached.get("last_date") == last_date_key:
+        model_obj = model_cached.get("model")
+        model_cache_hit = model_obj is not None
+
+    # --- Disk load (fast start) ---
     if not model_cache_hit:
-        # Use tuned params if available
-        p = tuned_params or {"n_estimators": 140, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
-        model = RandomForestRegressor(
-            n_estimators=int(p.get("n_estimators", 140)),
-            random_state=42,
-            n_jobs=-1,
-            max_depth=p.get("max_depth", 12),
-            min_samples_leaf=p.get("min_samples_leaf", 2),
-            max_features=p.get("max_features", "sqrt"),
-        )
-        model.fit(X, y)
+        if requested_model == "torch" and TORCH_AVAILABLE:
+            loaded = _torch_load(_torch_path(symbol, tf))
+            if loaded and (loaded.get("meta") or {}).get("last_date") == last_date_key:
+                model_obj = loaded
+                model_cache_hit = True
+        elif requested_model == "rf":
+            # RF persistence could be added, but sklearn pickle in Render can be flaky; keeping RAM cache for now.
+            pass
+
+    # --- Train if needed ---
+    if not model_cache_hit:
+        if requested_model == "torch":
+            # keep it fast for MVP
+            model_obj = _torch_train_and_fit(X, y, epochs=60, lr=1e-3)
+            # save torch model
+            _torch_save(model_obj, _torch_path(symbol, tf), meta={"last_date": last_date_key, "feature_cols": feature_cols})
+        else:
+            p = tuned_params or {"n_estimators": 140, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
+            model_obj = RandomForestRegressor(
+                n_estimators=int(p.get("n_estimators", 140)),
+                random_state=42,
+                n_jobs=-1,
+                max_depth=p.get("max_depth", 12),
+                min_samples_leaf=p.get("min_samples_leaf", 2),
+                max_features=p.get("max_features", "sqrt"),
+            )
+            model_obj.fit(X, y)
+
         cache_set(_model_cache, model_key, {
-            "model": model,
+            "model": model_obj,
             "last_date": last_date_key,
             "feature_cols": feature_cols,
+            "model_type": requested_model,
         })
 
+    # --- Update bias (“learn from mistakes”) using known last day ---
+    bias_obj = _update_bias_from_latest_known(
+        symbol=symbol,
+        tf=tf,
+        feat=feat,
+        feature_cols=feature_cols,
+        model_type=requested_model,
+        model_obj=model_obj,
+        last_date_key=last_date_key,
+    )
+    bias = float(bias_obj.get("bias", 0.0))
+
+    # --- Predict next close ---
     latest = feat.iloc[-1]
-    pred_next_close = float(model.predict(latest[feature_cols].values.reshape(1, -1))[0])
+    x_latest = latest[feature_cols].values.astype(float)
+
+    if requested_model == "torch":
+        pred_next_close = float(_torch_predict(model_obj, x_latest))
+    else:
+        pred_next_close = float(model_obj.predict(x_latest.reshape(1, -1))[0])
+
+    # Apply bias correction (learning)
+    pred_next_close_adj = pred_next_close + bias
 
     last_close = float(stock_df["Close"].iloc[-1])
 
     # Range estimate from recent volatility
     rets = stock_df["Close"].pct_change().dropna()
     recent_vol = float(rets.rolling(20).std().dropna().iloc[-1]) if len(rets) >= 25 else float(rets.std())
+    if not np.isfinite(recent_vol) or recent_vol <= 0:
+        recent_vol = 0.02
 
-    low = pred_next_close * (1 - recent_vol)
-    high = pred_next_close * (1 + recent_vol)
+    low = pred_next_close_adj * (1 - recent_vol)
+    high = pred_next_close_adj * (1 + recent_vol)
 
     confidence = float(np.clip(1 - (recent_vol * 5), 0.05, 0.9))
 
@@ -508,53 +735,52 @@ def predict(req: PredictRequest):
         "symbol": symbol,
         "timeframe": tf,
         "last_close": round(last_close, 2),
-        "prediction": round(pred_next_close, 2),
+        "prediction": round(pred_next_close_adj, 2),
         "range_low": round(low, 2),
         "range_high": round(high, 2),
         "confidence": round(confidence, 2),
         "data_points": int(len(stock_df)),
         "source": "stooq",
+        "model_type": requested_model,
+        "torch_available": TORCH_AVAILABLE,
+        "learning": {
+            "bias": round(bias, 4),
+            "bias_alpha": float(bias_obj.get("alpha", 0.20)),
+            "bias_last_err": float(bias_obj.get("last_err", 0.0)) if "last_err" in bias_obj else None,
+            "bias_updated_at": bias_obj.get("updated_at"),
+        },
         "market": {
             "SPY_last_close": round(spy_last, 2),
             "QQQ_last_close": round(qqq_last, 2),
-            "SPY_ret_1": round(spy_ret_1 * 100, 2),  # percent
+            "SPY_ret_1": round(spy_ret_1 * 100, 2),
             "QQQ_ret_1": round(qqq_ret_1 * 100, 2),
         },
         "backtest": {
-            "enabled": bool(ENABLE_TUNING),
-            "method": "walk_forward" if ENABLE_TUNING else None,
+            "enabled": bool(ENABLE_TUNING and requested_model == "rf"),
+            "method": "walk_forward" if (ENABLE_TUNING and requested_model == "rf") else None,
             "summary": bt_summary,
             "tune_cache_hit": bool(tune_cache_hit),
         },
-        "cache": {"hit": False, "ttl_sec": PRED_CACHE_TTL_SEC, "model_hit": bool(model_cache_hit), "tune_hit": bool(tune_cache_hit)},
+        "cache": {
+            "hit": False,
+            "ttl_sec": PRED_CACHE_TTL_SEC,
+            "model_hit": bool(model_cache_hit),
+            "tune_hit": bool(tune_cache_hit),
+        },
     }
 
     cache_set(_pred_cache, cache_key, payload)
     return payload
 
 
-# ----------------------------
-# Multi-horizon forecast endpoint
-# ----------------------------
-
-
 @app.post("/forecast")
 def forecast(req: ForecastRequest):
-    """Fast multi-horizon forecast.
-
-    We avoid training multiple models (which is slow). Instead:
-    - compute the 1-step predicted return from /predict (cached)
-    - scale drift ~ horizon, uncertainty ~ sqrt(horizon)
-
-    This makes forecasts return in milliseconds after the first predict.
-    """
     symbol = (req.symbol or "").upper().strip()
     if not symbol.isalnum():
         raise HTTPException(status_code=400, detail="Symbol must be letters/numbers only (e.g., AAPL)")
 
     tf = normalize_timeframe(req.timeframe)
 
-    # Sanitize horizons
     horizons = req.horizons or default_horizons(tf)
     try:
         horizons = [int(h) for h in horizons]
@@ -566,7 +792,6 @@ def forecast(req: ForecastRequest):
     if not horizons:
         horizons = default_horizons(tf)
 
-    # Use last candle date for cache key
     stock_df = get_symbol_df(symbol, tf)
     last_date = stock_df["Date"].iloc[-1]
     last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
@@ -576,20 +801,15 @@ def forecast(req: ForecastRequest):
     if cached is not None:
         return cached
 
-    # Get 1-step prediction (cached) to derive multi-horizon
-    pred_payload = cache_get(_pred_cache, f"{symbol}:{tf}", PRED_CACHE_TTL_SEC)
+    pred_payload = cache_get(_pred_cache, f"{symbol}:{tf}:{DEFAULT_MODEL_TYPE}", PRED_CACHE_TTL_SEC)
     if pred_payload is None:
-        # compute once (will populate caches)
-        pred_payload = predict(PredictRequest(symbol=symbol, timeframe=tf))
+        pred_payload = predict(PredictRequest(symbol=symbol, timeframe=tf, model=DEFAULT_MODEL_TYPE))  # populates caches
 
     last_close = float(pred_payload.get("last_close", stock_df["Close"].iloc[-1]))
     pred_next = float(pred_payload.get("prediction", last_close))
 
-    # 1-step drift as return
     r1 = (pred_next / last_close - 1.0) if last_close else 0.0
 
-    # Volatility for bands (reuse the one computed in predict if available)
-    # Otherwise compute from stock_df.
     rets = stock_df["Close"].pct_change().dropna()
     vol = float(rets.rolling(20).std().dropna().iloc[-1]) if len(rets) >= 25 else float(rets.std())
     if not np.isfinite(vol) or vol <= 0:
@@ -597,10 +817,7 @@ def forecast(req: ForecastRequest):
 
     items: list[dict[str, Any]] = []
     for h in horizons:
-        # drift grows roughly linearly with horizon
         pred_h = float(last_close * (1.0 + r1 * h))
-
-        # uncertainty grows with sqrt(h)
         band = last_close * vol * (h ** 0.5) * 1.25
         range_low = float(pred_h - band)
         range_high = float(pred_h + band)
@@ -631,27 +848,14 @@ def forecast(req: ForecastRequest):
     return payload
 
 
-# ----------------------------
-# Backtest endpoint (daily-cached)
-# ----------------------------
-
-
 @app.get("/backtest/{symbol}")
 def backtest(symbol: str, timeframe: str = "daily", force: bool = False):
-    """Return cached backtest metrics (auto daily) and allow on-demand recompute.
-
-    - Default: cached for 24 hours per symbol/timeframe/day.
-    - If `force=true`, recompute immediately.
-
-    Uses expanding walk-forward backtest on the current feature set.
-    """
     symbol = (symbol or "").upper().strip()
     if not symbol.isalnum():
         raise HTTPException(status_code=400, detail="Symbol must be letters/numbers only")
 
     tf = normalize_timeframe(timeframe)
 
-    # Include latest candle date in cache key so new data refreshes naturally
     stock_df = get_symbol_df(symbol, tf)
     last_date = stock_df["Date"].iloc[-1]
     last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
@@ -671,15 +875,12 @@ def backtest(symbol: str, timeframe: str = "daily", force: bool = False):
         raise HTTPException(status_code=400, detail="Not enough history to backtest")
 
     feat = make_features_with_market(stock_df, spy_df, qqq_df)
-    # Reasonably fast while still meaningful
     feat = feat.tail(900).reset_index(drop=True)
 
     feature_cols = get_feature_cols()
 
-    # Default params (fast)
     params = {"n_estimators": 140, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
 
-    # If tuning enabled, reuse tuned params (still cached)
     if ENABLE_TUNING:
         tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
         tuned = cache_get(_tune_cache, tune_key, TUNE_CACHE_TTL_SEC)
@@ -716,13 +917,11 @@ def backtest(symbol: str, timeframe: str = "daily", force: bool = False):
 # ----------------------------
 # News helpers
 # ----------------------------
-
 def _mk_id(url: str, title: str) -> str:
     raw = (url or "") + "|" + (title or "")
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
-
-def _fmt_time(s: str | None) -> str:
+def _fmt_time(s: Optional[str]) -> str:
     if not s:
         return ""
     try:
@@ -731,19 +930,8 @@ def _fmt_time(s: str | None) -> str:
     except Exception:
         return s
 
-
 @app.get("/news")
-def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
-    """
-    Market / ticker news endpoint.
-
-    Placeholder mode:
-      - If MARKET_AUX_TOKEN is not set, returns placeholder items.
-
-    Live mode (Marketaux):
-      - US-only, English news.
-      - If mode=ticker, requires `symbol`.
-    """
+def news(mode: str = "market", symbol: Optional[str] = None, limit: int = 6):
     mode = (mode or "market").strip().lower()
     if mode not in ("market", "ticker"):
         raise HTTPException(status_code=400, detail="mode must be market or ticker")
@@ -761,7 +949,7 @@ def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
 
     token = os.getenv("MARKET_AUX_TOKEN")
 
-    # ---------- Placeholder ----------
+    # Placeholder
     if not token:
         if mode == "market":
             items = [
@@ -794,16 +982,11 @@ def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
                 }
             ]
 
-        payload = {
-            "mode": mode,
-            "symbol": sym if sym else None,
-            "items": items,
-            "source": "placeholder",
-        }
+        payload = {"mode": mode, "symbol": sym if sym else None, "items": items, "source": "placeholder"}
         cache_set(_news_cache, cache_key, payload)
         return payload
 
-    # ---------- Live Marketaux ----------
+    # Live Marketaux
     url = "https://api.marketaux.com/v1/news/all"
     params = {
         "api_token": token,
@@ -845,25 +1028,15 @@ def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
             }
         )
 
-    payload = {
-        "mode": mode,
-        "symbol": sym if sym else None,
-        "items": items,
-        "source": "marketaux",
-    }
+    payload = {"mode": mode, "symbol": sym if sym else None, "items": items, "source": "marketaux"}
     cache_set(_news_cache, cache_key, payload)
     return payload
 
- 
+
 # ----------------------------
 # Symbols: S&P 500 (free source)
 # ----------------------------
-
 def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
-    """Fetch S&P 500 constituents from free CSV sources (no API key).
-
-    Some hosts block certain domains; we try multiple mirrors.
-    """
     urls = [
         "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
         "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv",
@@ -894,19 +1067,13 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
 
     df = pd.read_csv(StringIO(text))
 
-    # Accept multiple common schemas:
-    # - datasets/s-and-p-500-companies: Symbol, Name, Sector
-    # - wikipedia exports: Symbol, Security, GICS Sector, ...
     cols = {str(c).strip().lower(): c for c in df.columns}
-
     sym_col = cols.get("symbol")
     name_col = cols.get("name") or cols.get("security")
     sector_col = cols.get("sector") or cols.get("gics sector")
 
     if not sym_col or not name_col:
-        raise RuntimeError(
-            f"Unexpected CSV schema for S&P 500 constituents: {list(df.columns)}"
-        )
+        raise RuntimeError(f"Unexpected CSV schema for S&P 500 constituents: {list(df.columns)}")
 
     out: list[dict[str, Any]] = []
     for _, row in df.iterrows():
@@ -914,7 +1081,6 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
         if not sym:
             continue
         sym_alt = sym.replace(".", "-")  # BRK.B -> BRK-B
-
         name = str(row[name_col]).strip()
         sector = str(row[sector_col]).strip() if sector_col else ""
 
@@ -925,7 +1091,6 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
             "sector": sector,
         })
 
-    # Deduplicate by symbol
     seen = set()
     dedup = []
     for it in out:
@@ -934,20 +1099,15 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
         seen.add(it["symbol"])
         dedup.append(it)
 
-    # Sanity check
     if len(dedup) < 400:
         raise RuntimeError(f"SP500 list too small ({len(dedup)}). Source likely blocked/corrupt.")
 
     return dedup
 
-
 @app.get("/symbols/sp500")
 def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
-    """Return S&P 500 constituents for dropdown search. Cached for 24 hours."""
-    # Versioned cache key so old cached fallback doesn't stick after code changes
     cache_key = "sp500:v2"
 
-    # If cached payload is fallback, treat it as short-lived so it doesn't get stuck for 24h
     if not force_refresh:
         cached_any = _symbols_cache.get(cache_key)
         if cached_any is not None:
@@ -957,7 +1117,6 @@ def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
             if time.time() - ts <= ttl:
                 return val
             else:
-                # expired
                 try:
                     del _symbols_cache[cache_key]
                 except Exception:
@@ -969,7 +1128,6 @@ def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
         source = "free_csv"
     except Exception as e:
         fetch_error = f"{type(e).__name__}: {e}"
-        # Fallback if CSV is temporarily unavailable
         items = [
             {"symbol": "AAPL", "symbol_alt": None, "name": "Apple Inc.", "sector": "Information Technology"},
             {"symbol": "MSFT", "symbol_alt": None, "name": "Microsoft", "sector": "Information Technology"},
@@ -979,7 +1137,6 @@ def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
         ]
         source = "fallback"
 
-    # Apply limit (default allows all ~500)
     limit = int(max(1, min(limit, 2000)))
     items_out = items[:limit]
 
@@ -990,10 +1147,107 @@ def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
         "count": len(items_out),
         "error": fetch_error if source == "fallback" else None,
     }
-    # Cache: good data for 24h, fallback for 60s
+
     if source == "fallback":
         _symbols_cache[cache_key] = (time.time(), payload)
     else:
         cache_set(_symbols_cache, cache_key, payload)
 
     return payload
+
+
+# ----------------------------
+# Warmup (reduces first-request latency)
+# ----------------------------
+
+ENABLE_WARMUP = os.getenv("ENABLE_WARMUP", "1") == "1"
+WARMUP_SYMBOLS = os.getenv("WARMUP_SYMBOLS", "SPY,QQQ,AAPL")
+WARMUP_WEEKLY = os.getenv("WARMUP_WEEKLY", "1") == "1"
+# Optional: also warm model/prediction caches (slower startup, much faster first click)
+WARMUP_PREDICT = os.getenv("WARMUP_PREDICT", "0") == "1"
+# Comma-separated list: rf,torch (defaults to DEFAULT_MODEL_TYPE)
+WARMUP_MODEL_TYPES = os.getenv("WARMUP_MODEL_TYPES", "").strip()
+# Limit how many symbols we actually run predict on (keep startup reasonable)
+WARMUP_PREDICT_MAX_SYMBOLS = int(os.getenv("WARMUP_PREDICT_MAX_SYMBOLS", "2"))
+
+
+@app.on_event("startup")
+def _startup_warmup() -> None:
+    """Pre-fetch common datasets so the first user click is fast.
+
+    This warms the in-memory data cache used by Stooq downloads.
+    """
+    if not ENABLE_WARMUP:
+        return
+
+    t0 = time.time()
+
+    # Warm daily always; optionally warm weekly too
+    tfs = ["daily", "weekly"] if WARMUP_WEEKLY else ["daily"]
+
+    # Normalize symbols
+    syms = [s.strip().upper() for s in WARMUP_SYMBOLS.split(",") if s.strip()]
+    if not syms:
+        syms = ["SPY", "QQQ", "AAPL"]
+
+    warmed = 0
+
+    # 1) Warm market ETFs + a default ticker into _data_cache
+    for tf in tfs:
+        for sym in syms:
+            try:
+                # get_symbol_df() calls fetch_stooq_ohlcv() which populates _data_cache
+                _ = get_symbol_df(sym, tf)
+                warmed += 1
+            except Exception:
+                continue
+
+    # 2) Try to warm the S&P 500 symbol list cache (so the dropdown loads instantly)
+    try:
+        items = _fetch_sp500_from_free_csv()
+        payload = {
+            "items": items[:2000],
+            "source": "free_csv",
+            "cache_ttl_sec": SYMBOLS_CACHE_TTL_SEC,
+            "count": int(min(len(items), 2000)),
+            "error": None,
+        }
+        cache_set(_symbols_cache, "sp500:v2", payload)
+    except Exception:
+        # If blocked, we'll fall back to the existing runtime fallback behavior
+        pass
+
+    # 3) Optionally warm prediction/model caches (so first Predict click is fast)
+    if WARMUP_PREDICT:
+        # Decide model types to warm
+        if WARMUP_MODEL_TYPES:
+            model_types = [m.strip().lower() for m in WARMUP_MODEL_TYPES.split(",") if m.strip()]
+        else:
+            model_types = [DEFAULT_MODEL_TYPE]
+
+        # Respect torch availability
+        model_types = [m for m in model_types if m in ("rf", "torch")]
+        if not TORCH_AVAILABLE:
+            model_types = [m for m in model_types if m != "torch"]
+
+        # Only warm a small number of non-market symbols (SPY/QQQ are already warmed as data)
+        # We prefer warming AAPL first if present.
+        warm_syms = [s for s in syms if s not in ("SPY", "QQQ")]
+        if "AAPL" in syms and "AAPL" not in warm_syms:
+            warm_syms = ["AAPL"] + warm_syms
+        warm_syms = warm_syms[:max(0, WARMUP_PREDICT_MAX_SYMBOLS)]
+
+        pred_warmed = 0
+        for tf in tfs:
+            for sym in warm_syms:
+                for m in model_types:
+                    try:
+                        _ = predict(PredictRequest(symbol=sym, timeframe=tf, model=m))
+                        # also warm a small forecast cache since frontend calls it
+                        _ = forecast(ForecastRequest(symbol=sym, timeframe=tf, horizons=None))
+                        pred_warmed += 1
+                    except Exception:
+                        continue
+
+    dt = time.time() - t0
+    print(f"[warmup] ENABLE_WARMUP=1 warmed_data={warmed} tf={tfs} symbols={syms} warmup_predict={int(WARMUP_PREDICT)} in {dt:.2f}s")
