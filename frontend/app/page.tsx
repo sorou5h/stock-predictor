@@ -116,6 +116,12 @@ export default function Home() {
   const [pred, setPred] = useState<PredictResponse | null>(null);
   const [hist, setHist] = useState<HistoryResponse | null>(null);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
+
+  // Live price ticker
+  const [livePrice, setLivePrice] = useState<number | null>(null);
+  const [liveChangePct, setLiveChangePct] = useState<number | null>(null);
+  const [liveUpdatedAt, setLiveUpdatedAt] = useState<string | null>(null);
+  const [liveLoading, setLiveLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
@@ -229,6 +235,9 @@ export default function Home() {
     const s = symbol.trim().toUpperCase();
     if (!s) return;
 
+    // Refresh ticker immediately
+    fetchLiveQuote(s);
+
     setLoading(true);
     setError(null);
 
@@ -303,6 +312,51 @@ export default function Home() {
       setLoadingMsg(null);
     }
   }
+
+  async function fetchLiveQuote(symRaw?: string) {
+    const s = (symRaw ?? symbol).trim().toUpperCase();
+    if (!s) return;
+
+    setLiveLoading(true);
+    try {
+      // Use last 2 candles to compute change
+      const res = await fetch(
+        `${API_BASE}/history/${encodeURIComponent(s)}?timeframe=${timeframe}&points=2`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) throw new Error(`Live price error: ${res.status}`);
+
+      const j = (await res.json()) as HistoryResponse;
+      const cs = j?.candles ?? [];
+      if (cs.length === 0) return;
+
+      const last = cs[cs.length - 1];
+      const prev = cs.length >= 2 ? cs[cs.length - 2] : null;
+
+      const lastClose = Number(last.close);
+      const prevClose = prev ? Number(prev.close) : lastClose;
+      const pct = prevClose ? ((lastClose - prevClose) / prevClose) * 100 : 0;
+
+      setLivePrice(lastClose);
+      setLiveChangePct(pct);
+      setLiveUpdatedAt(new Date().toLocaleTimeString());
+    } catch {
+      // Don't break the page if quote fails
+      setLivePrice(null);
+      setLiveChangePct(null);
+      setLiveUpdatedAt(null);
+    } finally {
+      setLiveLoading(false);
+    }
+  }
+
+  // Poll live price every 30s (updates when symbol/timeframe changes)
+  useEffect(() => {
+    fetchLiveQuote();
+    const id = window.setInterval(() => fetchLiveQuote(), 30_000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, timeframe]);
 
   const changePct =
     pred ? ((pred.prediction - pred.last_close) / pred.last_close) * 100 : null;
@@ -397,6 +451,47 @@ export default function Home() {
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Cache: {pred?.cache?.hit ? "hit" : pred ? "miss" : "—"}
             </span>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
+            <span className="text-xs text-zinc-400">Live</span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-xs text-zinc-200">
+              {symbol.trim().toUpperCase() || "—"}
+            </span>
+
+            {liveLoading && livePrice === null ? (
+              <span className="text-sm text-zinc-500">Loading price…</span>
+            ) : livePrice !== null ? (
+              <>
+                <span className="text-sm font-semibold">${fmtMoney(livePrice)}</span>
+                {liveChangePct !== null && (
+                  <span
+                    className={
+                      liveChangePct >= 0
+                        ? "text-xs text-emerald-200"
+                        : "text-xs text-red-200"
+                    }
+                  >
+                    {liveChangePct >= 0 ? "+" : ""}
+                    {liveChangePct.toFixed(2)}%
+                  </span>
+                )}
+                <span className="text-xs text-zinc-500">
+                  Updated {liveUpdatedAt ?? "—"}
+                </span>
+              </>
+            ) : (
+              <span className="text-sm text-zinc-500">Price unavailable</span>
+            )}
+
+            <button
+              type="button"
+              onClick={() => fetchLiveQuote()}
+              className="ml-auto rounded-xl px-3 py-1.5 bg-zinc-100 text-zinc-900 text-xs font-medium hover:bg-white disabled:opacity-60"
+              disabled={liveLoading}
+              title="Refresh live price"
+            >
+              {liveLoading ? "Refreshing…" : "Refresh"}
+            </button>
           </div>
         </header>
 
