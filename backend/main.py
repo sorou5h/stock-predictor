@@ -674,12 +674,26 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
 
 
 @app.get("/symbols/sp500")
-def symbols_sp500(limit: int = 2000):
+def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
     """Return S&P 500 constituents for dropdown search. Cached for 24 hours."""
-    cache_key = "sp500"
-    cached = cache_get(_symbols_cache, cache_key, SYMBOLS_CACHE_TTL_SEC)
-    if cached is not None:
-        return cached
+    # Versioned cache key so old cached fallback doesn't stick after code changes
+    cache_key = "sp500:v2"
+
+    # If cached payload is fallback, treat it as short-lived so it doesn't get stuck for 24h
+    if not force_refresh:
+        cached_any = _symbols_cache.get(cache_key)
+        if cached_any is not None:
+            ts, val = cached_any
+            cached_source = (val.get("source") if isinstance(val, dict) else None)
+            ttl = 60 if cached_source == "fallback" else SYMBOLS_CACHE_TTL_SEC
+            if time.time() - ts <= ttl:
+                return val
+            else:
+                # expired
+                try:
+                    del _symbols_cache[cache_key]
+                except Exception:
+                    pass
 
     try:
         items = _fetch_sp500_from_free_csv()
@@ -705,5 +719,10 @@ def symbols_sp500(limit: int = 2000):
         "cache_ttl_sec": SYMBOLS_CACHE_TTL_SEC,
         "count": len(items_out),
     }
-    cache_set(_symbols_cache, cache_key, payload)
+    # Cache: good data for 24h, fallback for 60s
+    if source == "fallback":
+        _symbols_cache[cache_key] = (time.time(), payload)
+    else:
+        cache_set(_symbols_cache, cache_key, payload)
+
     return payload
