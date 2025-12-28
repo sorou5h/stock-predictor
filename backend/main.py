@@ -162,19 +162,25 @@ def build_rf(params: Optional[dict] = None) -> RandomForestRegressor:
 # ----------------------------
 # PyTorch model (small MLP regressor)
 # ----------------------------
-class TorchMLP(nn.Module):
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
+if TORCH_AVAILABLE:
+    class TorchMLP(nn.Module):
+        def __init__(self, in_dim: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 64),
+                nn.ReLU(),
+                nn.Linear(64, 1),
+            )
 
-    def forward(self, x):
-        return self.net(x)
+        def forward(self, x):
+            return self.net(x)
+else:
+    # Dummy placeholder to prevent NameError during import when torch isn't installed.
+    # Any attempt to train/predict with torch will raise a clear error via helpers below.
+    TorchMLP = None  # type: ignore
+
 
 def _torch_train_and_fit(X: np.ndarray, y: np.ndarray, epochs: int = 60, lr: float = 1e-3) -> Any:
     """Train a tiny MLP quickly on CPU. Returns dict with model + normalization."""
@@ -192,7 +198,7 @@ def _torch_train_and_fit(X: np.ndarray, y: np.ndarray, epochs: int = 60, lr: flo
     sig = np.where(sig < 1e-8, 1.0, sig)
     Xn = (X - mu) / sig
 
-    model = TorchMLP(in_dim=Xn.shape[1]).to(device)
+    model = TorchMLP(in_dim=Xn.shape[1]).to(device)  # type: ignore
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.SmoothL1Loss()
 
@@ -209,6 +215,7 @@ def _torch_train_and_fit(X: np.ndarray, y: np.ndarray, epochs: int = 60, lr: flo
 
     return {"model": model, "mu": mu, "sig": sig}
 
+
 def _torch_predict(fit_obj: Any, x: np.ndarray) -> float:
     if not TORCH_AVAILABLE:
         raise RuntimeError("torch_not_installed")
@@ -222,6 +229,7 @@ def _torch_predict(fit_obj: Any, x: np.ndarray) -> float:
         out = model(torch.from_numpy(xn)).cpu().numpy().reshape(-1)[0]
     return float(out)
 
+
 def _torch_save(fit_obj: Any, path: str, meta: dict):
     """Save torch weights + normalization + meta."""
     if not TORCH_AVAILABLE:
@@ -234,6 +242,7 @@ def _torch_save(fit_obj: Any, path: str, meta: dict):
     }
     torch.save(payload, path)
 
+
 def _torch_load(path: str) -> Optional[Any]:
     if not TORCH_AVAILABLE:
         return None
@@ -245,7 +254,7 @@ def _torch_load(path: str) -> Optional[Any]:
         sig = payload["sig"]
         meta = payload.get("meta") or {}
         in_dim = int(len(mu))
-        model = TorchMLP(in_dim=in_dim)
+        model = TorchMLP(in_dim=in_dim)  # type: ignore
         model.load_state_dict(payload["state_dict"])
         return {"model": model, "mu": mu, "sig": sig, "meta": meta}
     except Exception:
