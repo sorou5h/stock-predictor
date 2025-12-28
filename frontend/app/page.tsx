@@ -14,8 +14,9 @@ const API_BASE =
 type AssetType = "stock" | "crypto";
 
 type PredictResponse = {
-  symbol: string;
-  timeframe: "daily" | "weekly";
+  symbol?: string; // stocks
+  pair?: string; // crypto
+  timeframe: "daily" | "weekly" | "hourly";
   last_close: number;
   prediction: number;
   range_low: number;
@@ -42,8 +43,9 @@ type ForecastItem = {
 };
 
 type ForecastResponse = {
-  symbol: string;
-  timeframe: "daily" | "weekly";
+  symbol?: string;
+  pair?: string;
+  timeframe: "daily" | "weekly" | "hourly";
   last_close: number;
   as_of: string;
   horizons: ForecastItem[];
@@ -51,8 +53,9 @@ type ForecastResponse = {
 };
 
 type HistoryResponse = {
-  symbol: string;
-  timeframe: "daily" | "weekly";
+  symbol?: string;
+  pair?: string;
+  timeframe: "daily" | "weekly" | "hourly";
   candles: {
     time: string;
     open: number;
@@ -94,14 +97,13 @@ type SymbolsResponse = {
 };
 
 type CryptoSymbolItem = {
-  symbol: string; // e.g. BTC
+  pair: string; // e.g. BTC-USD
   name?: string | null;
 };
 
 type CryptoSymbolsResponse = {
   items: CryptoSymbolItem[];
   source: string;
-  count: number;
 };
 
 type BacktestResponse = {
@@ -194,6 +196,17 @@ export default function Home() {
 
   function isCrypto() {
     return assetType === "crypto";
+  }
+
+  function normalizeCryptoPair(input: string) {
+    const s = (input || "").trim().toUpperCase();
+    if (!s) return "BTC-USD";
+    if (s.includes("-")) return s;
+    return `${s}-USD`;
+  }
+
+  function displaySymbol() {
+    return (pred?.symbol ?? pred?.pair ?? symbol).toString().toUpperCase();
   }
 
   function predictUrl() {
@@ -321,9 +334,9 @@ export default function Home() {
       const list = cryptoSymbols;
       if (!q) return list.slice(0, 25);
       const matches = list.filter((it) => {
-        const sym = (it.symbol ?? "").toLowerCase();
+        const pair = (it.pair ?? "").toLowerCase();
         const name = (it.name ?? "").toLowerCase();
-        return sym.includes(q) || name.includes(q);
+        return pair.includes(q) || name.includes(q);
       });
       return matches.slice(0, 25);
     }
@@ -356,7 +369,8 @@ export default function Home() {
   }, [symbol]);
 
   async function run() {
-    const s = symbol.trim().toUpperCase();
+    const raw = symbol.trim().toUpperCase();
+    const s = isCrypto() ? normalizeCryptoPair(raw) : raw;
     if (!s) return;
 
     // Refresh ticker immediately
@@ -403,13 +417,17 @@ export default function Home() {
         fetch(predictUrl(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbol: s, timeframe }),
+          body: JSON.stringify(
+            isCrypto() ? { pair: s, timeframe } : { symbol: s, timeframe }
+          ),
         }),
         fetch(historyUrl(s, timeframe, 200)),
         fetch(forecastUrl(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbol: s, timeframe }),
+          body: JSON.stringify(
+            isCrypto() ? { pair: s, timeframe } : { symbol: s, timeframe }
+          ),
         }),
       ]);
 
@@ -447,7 +465,8 @@ export default function Home() {
   }
 
   async function runBacktest(force = false, symRaw?: string) {
-    const s = (symRaw ?? symbol).trim().toUpperCase();
+    const raw = (symRaw ?? symbol).trim().toUpperCase();
+    const s = raw; // backtest is stock-only
     if (!s) return;
 
     // Crypto: skip backtest (optional)
@@ -479,12 +498,15 @@ export default function Home() {
   }
 
   async function fetchLiveQuote(symRaw?: string) {
-    const s = (symRaw ?? symbol).trim().toUpperCase();
+    const raw = (symRaw ?? symbol).trim().toUpperCase();
+    const s = isCrypto() ? normalizeCryptoPair(raw) : raw;
     if (!s) return;
 
     setLiveLoading(true);
     try {
-      const res = await fetch(historyUrl(s, timeframe, 2), { cache: "no-store" });
+      const res = await fetch(historyUrl(s, timeframe, 2), {
+        cache: "no-store",
+      });
       if (!res.ok) throw new Error(`Live price error: ${res.status}`);
 
       const j = (await res.json()) as HistoryResponse;
@@ -608,7 +630,11 @@ export default function Home() {
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Backend:{" "}
-              {backendOk === null ? "checking…" : backendOk ? "online" : "offline"}
+              {backendOk === null
+                ? "checking…"
+                : backendOk
+                ? "online"
+                : "offline"}
             </span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Asset: {assetType === "crypto" ? "crypto" : "stock"}
@@ -630,14 +656,16 @@ export default function Home() {
           <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
             <span className="text-xs text-zinc-400">Live</span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-xs text-zinc-200">
-              {symbol.trim().toUpperCase() || "—"}
+              {displaySymbol() || "—"}
             </span>
 
             {liveLoading && livePrice === null ? (
               <span className="text-sm text-zinc-500">Loading price…</span>
             ) : livePrice !== null ? (
               <>
-                <span className="text-sm font-semibold">${fmtMoney(livePrice)}</span>
+                <span className="text-sm font-semibold">
+                  ${fmtMoney(livePrice)}
+                </span>
                 {liveChangePct !== null && (
                   <span
                     className={
@@ -700,7 +728,10 @@ export default function Home() {
                     onClick={() => {
                       setAssetType("crypto");
                       const next = symbol.trim().toUpperCase();
-                      const pick = next && next.length <= 6 ? next : "BTC";
+                      const pick =
+                        next && next.includes("-")
+                          ? next
+                          : normalizeCryptoPair(next || "BTC");
                       setSymbol(pick);
                       setSymbolQuery(pick);
                       setNewsTab("market");
@@ -734,7 +765,7 @@ export default function Home() {
                       assetType === "crypto"
                         ? cryptoSymbolsLoading
                           ? "Loading crypto…"
-                          : "Search crypto (e.g., BTC, ETH)"
+                          : "Search crypto (e.g., BTC-USD, ETH-USD)"
                         : symbolsLoading
                         ? "Loading S&P 500…"
                         : "Search S&P 500 (e.g., Apple or AAPL)"
@@ -756,12 +787,17 @@ export default function Home() {
                             </div>
                           ) : filteredSymbols.length === 0 ? (
                             <div className="p-3 text-sm text-zinc-500">
-                              No matches. You can still type BTC, ETH, etc.
+                              No matches. You can still type BTC-USD, ETH-USD,
+                              etc.
                             </div>
                           ) : (
                             filteredSymbols.map((it: any) => {
-                              const displaySymbol = String(it.symbol ?? "").toUpperCase();
-                              const displayName = it.name ? String(it.name) : "Cryptocurrency";
+                              const displaySymbol = String(
+                                it.pair ?? ""
+                              ).toUpperCase();
+                              const displayName = it.name
+                                ? String(it.name)
+                                : "Cryptocurrency";
 
                               return (
                                 <button
@@ -806,9 +842,13 @@ export default function Home() {
                           </div>
                         ) : (
                           filteredSymbols.map((it: any) => {
-                            const displaySymbol = String((it.symbol_alt ?? it.symbol) ?? "").toUpperCase();
+                            const displaySymbol = String(
+                              (it.symbol_alt ?? it.symbol) ?? ""
+                            ).toUpperCase();
                             const displayName = String(it.name ?? "");
-                            const displayMeta = it.sector ? String(it.sector) : null;
+                            const displayMeta = it.sector
+                              ? String(it.sector)
+                              : null;
 
                             return (
                               <button
@@ -831,7 +871,9 @@ export default function Home() {
                                       </span>
                                     </div>
                                     {displayMeta ? (
-                                      <div className="mt-1 text-xs text-zinc-500 truncate">{displayMeta}</div>
+                                      <div className="mt-1 text-xs text-zinc-500 truncate">
+                                        {displayMeta}
+                                      </div>
                                     ) : null}
                                   </div>
                                   <span className="text-xs text-zinc-400">
@@ -851,7 +893,7 @@ export default function Home() {
                       ? cryptoSymbolsLoading
                         ? "Loading crypto…"
                         : cryptoSymbolsError
-                        ? "Crypto symbols failed to load — you can still type BTC, ETH, etc."
+                        ? "Crypto symbols failed to load — you can still type BTC-USD, ETH-USD, etc."
                         : `Loaded ${cryptoSymbols.length} crypto symbols.`
                       : symbolsLoading
                       ? "Loading symbols…"
@@ -1002,7 +1044,8 @@ export default function Home() {
             <div className="mt-4 h-[340px] min-w-0 w-full rounded-2xl border border-zinc-800 bg-zinc-950 p-3">
               {candles.length === 0 ? (
                 <div className="h-full flex items-center justify-center text-sm text-zinc-500">
-                  Run a prediction to load the candlestick chart (last 200 candles).
+                  Run a prediction to load the candlestick chart (last 200
+                  candles).
                 </div>
               ) : (
                 <CandleChart
@@ -1034,7 +1077,7 @@ export default function Home() {
               <div className="mt-4 space-y-4">
                 <div>
                   <div className="text-xs text-zinc-500">Symbol</div>
-                  <div className="text-lg font-semibold">{pred.symbol}</div>
+                  <div className="text-lg font-semibold">{displaySymbol()}</div>
                   <div className="text-xs text-zinc-500 mt-1">
                     Timeframe: {pred.timeframe}
                   </div>
@@ -1068,7 +1111,9 @@ export default function Home() {
                     <div className="mt-3 grid grid-cols-1 gap-2">
                       {forecast.horizons.map((it) => {
                         const label =
-                          timeframe === "daily" ? `${it.horizon}D` : `${it.horizon}W`;
+                          timeframe === "daily"
+                            ? `${it.horizon}D`
+                            : `${it.horizon}W`;
                         return (
                           <div
                             key={it.horizon}
@@ -1082,7 +1127,8 @@ export default function Home() {
                                 ${fmtMoney(it.prediction)}
                               </span>
                               <span className="text-xs text-zinc-500">
-                                (${fmtMoney(it.range_low)}–${fmtMoney(it.range_high)})
+                                (${fmtMoney(it.range_low)}–$
+                                {fmtMoney(it.range_high)})
                               </span>
                             </div>
                             <span
@@ -1141,7 +1187,9 @@ export default function Home() {
                           : `Bearish (${pct.toFixed(2)}%)`;
                       return (
                         <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                          <div className="text-[11px] text-zinc-500">Direction</div>
+                          <div className="text-[11px] text-zinc-500">
+                            Direction
+                          </div>
                           <div className="mt-1">{toneBadge(label, tone)}</div>
                         </div>
                       );
@@ -1152,17 +1200,23 @@ export default function Home() {
                         const bias = marketBias(pred.market);
                         return (
                           <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                            <div className="text-[11px] text-zinc-500">Market mood</div>
+                            <div className="text-[11px] text-zinc-500">
+                              Market mood
+                            </div>
                             <div className="mt-1 flex flex-wrap items-center gap-2">
                               {toneBadge(bias.label, bias.tone)}
-                              <span className="text-[11px] text-zinc-500">{bias.detail}</span>
+                              <span className="text-[11px] text-zinc-500">
+                                {bias.detail}
+                              </span>
                             </div>
                           </div>
                         );
                       })()
                     ) : (
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">Market mood</div>
+                        <div className="text-[11px] text-zinc-500">
+                          Market mood
+                        </div>
                         <div className="mt-1 text-[11px] text-zinc-500">
                           Crypto mode (no SPY/QQQ)
                         </div>
@@ -1178,10 +1232,14 @@ export default function Home() {
                       const r = riskLabelFromMove(mv);
                       return (
                         <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                          <div className="text-[11px] text-zinc-500">Expected move</div>
+                          <div className="text-[11px] text-zinc-500">
+                            Expected move
+                          </div>
                           <div className="mt-1 flex flex-wrap items-center gap-2">
                             {toneBadge(`~${mv.toFixed(1)}%`, r.tone)}
-                            <span className="text-[11px] text-zinc-500">Range-based</span>
+                            <span className="text-[11px] text-zinc-500">
+                              Range-based
+                            </span>
                           </div>
                         </div>
                       );
@@ -1211,8 +1269,9 @@ export default function Home() {
                   </div>
 
                   <p className="mt-3 text-[11px] text-zinc-500 leading-relaxed">
-                    This breakdown is a simple explanation based on model inputs. It helps
-                    interpret the output, but it does not prove causation.
+                    This breakdown is a simple explanation based on model inputs.
+                    It helps interpret the output, but it does not prove
+                    causation.
                   </p>
                 </div>
 
@@ -1266,9 +1325,14 @@ export default function Home() {
                   ) : bt.metrics?.ok ? (
                     <div className="mt-3 grid grid-cols-2 gap-2">
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">Direction accuracy</div>
+                        <div className="text-[11px] text-zinc-500">
+                          Direction accuracy
+                        </div>
                         <div className="mt-1 text-sm font-semibold">
-                          {((bt.metrics.direction_accuracy ?? 0) * 100).toFixed(1)}%
+                          {((bt.metrics.direction_accuracy ?? 0) * 100).toFixed(
+                            1
+                          )}
+                          %
                         </div>
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
@@ -1312,8 +1376,9 @@ export default function Home() {
                   </summary>
                   <div className="mt-3 space-y-3 text-sm text-zinc-400">
                     <p>
-                      This is a demo model trained on historical candles using technical features
-                      (returns, moving averages, volatility, volume signals).
+                      This is a demo model trained on historical candles using
+                      technical features (returns, moving averages, volatility,
+                      volume signals).
                       {assetType === "stock"
                         ? " Stocks also include market context from SPY and QQQ."
                         : " Crypto runs without SPY/QQQ market context."}
@@ -1368,7 +1433,7 @@ export default function Home() {
               >
                 {assetType === "crypto"
                   ? "Ticker (disabled)"
-                  : symbol.trim().toUpperCase() || "Ticker"}
+                  : displaySymbol() || "Ticker"}
               </button>
             </div>
           </div>
