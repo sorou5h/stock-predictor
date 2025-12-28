@@ -46,9 +46,12 @@ MODEL_CACHE_TTL_SEC = 60 * 60  # 1 hour
 _model_cache: dict[str, tuple[float, Any]] = {}
 # stored value: {"model": fitted_model, "last_date": "YYYY-MM-DD", "feature_cols": [...]} 
 
-# Tune cache: avoid re-running backtests constantly
+ # Tune cache: avoid re-running backtests constantly
 TUNE_CACHE_TTL_SEC = 6 * 60 * 60  # 6 hours
 _tune_cache: dict[str, tuple[float, Any]] = {}
+
+# Turn on expensive backtest/tuning only when explicitly enabled
+ENABLE_TUNING = os.getenv("ENABLE_TUNING", "0") == "1"
 
 # News cache
 NEWS_CACHE_TTL_SEC = 10 * 60  # 10 minutes
@@ -419,20 +422,25 @@ def predict(req: PredictRequest):
     feat = make_features_with_market(stock_df, spy_df, qqq_df)
 
     # Keep computations fast: use a recent window of feature rows
-    feat = feat.tail(900).reset_index(drop=True)
+    feat = feat.tail(600).reset_index(drop=True)
 
     feature_cols = get_feature_cols()
 
-    # Auto-tune (cached) using walk-forward backtest
-    tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
-    tuned = cache_get(_tune_cache, tune_key, TUNE_CACHE_TTL_SEC)
-    tune_cache_hit = tuned is not None
-    if tuned is None:
-        tuned = _tune_params_for_symbol(feat, feature_cols)
-        cache_set(_tune_cache, tune_key, tuned)
+    # Optional: expensive backtest/tuning (disabled by default for speed)
+    tuned_params = None
+    bt_summary = None
+    tune_cache_hit = False
 
-    tuned_params = tuned.get("params") if isinstance(tuned, dict) else None
-    bt_summary = tuned.get("backtest") if isinstance(tuned, dict) else None
+    if ENABLE_TUNING:
+        tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
+        tuned = cache_get(_tune_cache, tune_key, TUNE_CACHE_TTL_SEC)
+        tune_cache_hit = tuned is not None
+        if tuned is None:
+            tuned = _tune_params_for_symbol(feat, feature_cols)
+            cache_set(_tune_cache, tune_key, tuned)
+
+        tuned_params = tuned.get("params") if isinstance(tuned, dict) else None
+        bt_summary = tuned.get("backtest") if isinstance(tuned, dict) else None
 
     X = feat[feature_cols].values
     y = feat["target_next_close"].values
@@ -451,9 +459,9 @@ def predict(req: PredictRequest):
 
     if not model_cache_hit:
         # Use tuned params if available
-        p = tuned_params or {"n_estimators": 180, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
+        p = tuned_params or {"n_estimators": 140, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
         model = RandomForestRegressor(
-            n_estimators=int(p.get("n_estimators", 180)),
+            n_estimators=int(p.get("n_estimators", 140)),
             random_state=42,
             n_jobs=-1,
             max_depth=p.get("max_depth", 12),
@@ -504,7 +512,8 @@ def predict(req: PredictRequest):
             "QQQ_ret_1": round(qqq_ret_1 * 100, 2),
         },
         "backtest": {
-            "method": "walk_forward",
+            "enabled": bool(ENABLE_TUNING),
+            "method": "walk_forward" if ENABLE_TUNING else None,
             "summary": bt_summary,
             "tune_cache_hit": bool(tune_cache_hit),
         },
@@ -519,13 +528,16 @@ def predict(req: PredictRequest):
 # Multi-horizon forecast endpoint
 # ----------------------------
 
+
 @app.post("/forecast")
 def forecast(req: ForecastRequest):
-    """Multi-horizon forecast for the selected timeframe.
+    """Fast multi-horizon forecast.
 
-    Returns multiple predicted closes for future horizons.
-    Daily default horizons: 1D, 3D, 5D
-    Weekly default horizons: 1W, 2W, 4W
+    We avoid training multiple models (which is slow). Instead:
+    - compute the 1-step predicted return from /predict (cached)
+    - scale drift ~ horizon, uncertainty ~ sqrt(horizon)
+
+    This makes forecasts return in milliseconds after the first predict.
     """
     symbol = (req.symbol or "").upper().strip()
     if not symbol.isalnum():
@@ -545,7 +557,7 @@ def forecast(req: ForecastRequest):
     if not horizons:
         horizons = default_horizons(tf)
 
-    # Fetch data
+    # Use last candle date for cache key
     stock_df = get_symbol_df(symbol, tf)
     last_date = stock_df["Date"].iloc[-1]
     last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
@@ -555,56 +567,36 @@ def forecast(req: ForecastRequest):
     if cached is not None:
         return cached
 
-    spy_df = get_symbol_df("SPY", tf)
-    qqq_df = get_symbol_df("QQQ", tf)
+    # Get 1-step prediction (cached) to derive multi-horizon
+    pred_payload = cache_get(_pred_cache, f"{symbol}:{tf}", PRED_CACHE_TTL_SEC)
+    if pred_payload is None:
+        # compute once (will populate caches)
+        pred_payload = predict(PredictRequest(symbol=symbol, timeframe=tf))
 
-    if len(stock_df) < 160 or len(spy_df) < 160 or len(qqq_df) < 160:
-        raise HTTPException(status_code=400, detail="Not enough history to forecast")
+    last_close = float(pred_payload.get("last_close", stock_df["Close"].iloc[-1]))
+    pred_next = float(pred_payload.get("prediction", last_close))
 
-    feat = make_features_with_market(stock_df, spy_df, qqq_df)
-    feat = feat.tail(900).reset_index(drop=True)
+    # 1-step drift as return
+    r1 = (pred_next / last_close - 1.0) if last_close else 0.0
 
-    feature_cols = get_feature_cols()
-
-    # Reuse tuned params if we have them
-    tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
-    tuned = cache_get(_tune_cache, tune_key, TUNE_CACHE_TTL_SEC)
-    tuned_params = tuned.get("params") if isinstance(tuned, dict) else None
-
-    last_close = float(stock_df["Close"].iloc[-1])
-
-    # Simple volatility estimate for bands
-    vol = float(feat["ret_1"].std()) if "ret_1" in feat.columns else 0.02
+    # Volatility for bands (reuse the one computed in predict if available)
+    # Otherwise compute from stock_df.
+    rets = stock_df["Close"].pct_change().dropna()
+    vol = float(rets.rolling(20).std().dropna().iloc[-1]) if len(rets) >= 25 else float(rets.std())
     if not np.isfinite(vol) or vol <= 0:
         vol = 0.02
 
     items: list[dict[str, Any]] = []
-
     for h in horizons:
-        dfh = feat.copy()
-        dfh["target_h"] = dfh["Close"].shift(-h)
-        dfh = dfh.dropna().reset_index(drop=True)
+        # drift grows roughly linearly with horizon
+        pred_h = float(last_close * (1.0 + r1 * h))
 
-        if len(dfh) < 140:
-            continue
-
-        X = dfh[feature_cols].values
-        y = dfh["target_h"].values
-
-        model = build_rf(tuned_params)
-        model.fit(X, y)
-
-        x_last = feat.iloc[-1][feature_cols].values.reshape(1, -1)
-        pred_h = float(model.predict(x_last)[0])
-
-        # Uncertainty band grows with sqrt(h)
+        # uncertainty grows with sqrt(h)
         band = last_close * vol * (h ** 0.5) * 1.25
         range_low = float(pred_h - band)
         range_high = float(pred_h + band)
 
         change_pct = ((pred_h - last_close) / last_close) * 100 if last_close else 0.0
-
-        # Confidence decays with horizon and volatility
         conf = clamp(1.0 - (abs(vol) * (h ** 0.5) * 6.0), 0.05, 0.95)
 
         items.append({
@@ -615,17 +607,6 @@ def forecast(req: ForecastRequest):
             "change_pct": round(change_pct, 2),
             "confidence": round(conf, 2),
         })
-
-    # If for some reason we couldn't produce anything, return a safe response
-    if not items:
-        items = [{
-            "horizon": 1,
-            "prediction": round(last_close, 2),
-            "range_low": round(last_close, 2),
-            "range_high": round(last_close, 2),
-            "change_pct": 0.0,
-            "confidence": 0.1,
-        }]
 
     payload = {
         "symbol": symbol,
