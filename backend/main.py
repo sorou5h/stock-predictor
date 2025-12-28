@@ -671,7 +671,7 @@ def _fetch_sp500_from_wikipedia() -> list[dict[str, Any]]:
 
 
 @app.get("/symbols/sp500")
-def symbols_sp500(limit: int = 600):
+def symbols_sp500(limit: int = 2000):
     """Return S&P 500 constituents for dropdown search. Cached for 24 hours."""
     cache_key = "sp500"
     cached = cache_get(_symbols_cache, cache_key, SYMBOLS_CACHE_TTL_SEC)
@@ -694,7 +694,7 @@ def symbols_sp500(limit: int = 600):
 
     limit = int(max(1, min(limit, 2000)))
     payload = {
-        "items": items[:limit],
+        "items": items,
         "source": source,
         "cache_ttl_sec": SYMBOLS_CACHE_TTL_SEC,
         "count": min(len(items), limit),
