@@ -43,6 +43,10 @@ MODEL_CACHE_TTL_SEC = 60 * 60  # 1 hour
 _model_cache: dict[str, tuple[float, Any]] = {}
 # stored value: {"model": fitted_model, "last_date": "YYYY-MM-DD", "feature_cols": [...]} 
 
+# Tune cache: avoid re-running backtests constantly
+TUNE_CACHE_TTL_SEC = 6 * 60 * 60  # 6 hours
+_tune_cache: dict[str, tuple[float, Any]] = {}
+
 # News cache
 NEWS_CACHE_TTL_SEC = 10 * 60  # 10 minutes
 _news_cache: dict[str, tuple[float, dict]] = {}
@@ -166,6 +170,117 @@ def make_features_with_market(stock_df: pd.DataFrame, spy_df: pd.DataFrame, qqq_
     return out
 
 
+# ----------------------------
+# Backtest + tuning (Option A)
+# ----------------------------
+
+def _walk_forward_backtest(
+    feat: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    params: dict,
+    max_test_points: int = 50,
+    retrain_every: int = 5,
+) -> dict[str, Any]:
+    """Expanding-window walk-forward backtest (fast).
+
+    To keep it fast:
+      - evaluates only the most recent `max_test_points` steps
+      - retrains only every `retrain_every` steps
+    """
+    n = len(feat)
+    if n < 120:
+        return {"ok": False, "reason": "not_enough_data"}
+
+    test_points = int(min(max_test_points, max(10, n // 10)))
+    start = n - test_points
+
+    y_true: list[float] = []
+    y_pred: list[float] = []
+    dir_hits = 0
+
+    model = None
+
+    for i in range(start, n):
+        X_train = feat.iloc[:i][feature_cols].values
+        y_train = feat.iloc[:i][target_col].values
+
+        if (model is None) or ((i - start) % retrain_every == 0):
+            model = RandomForestRegressor(
+                n_estimators=int(params.get("n_estimators", 140)),
+                random_state=42,
+                n_jobs=-1,
+                max_depth=params.get("max_depth", 10),
+                min_samples_leaf=params.get("min_samples_leaf", 2),
+                max_features=params.get("max_features", "sqrt"),
+            )
+            model.fit(X_train, y_train)
+
+        x_i = feat.iloc[i][feature_cols].values.reshape(1, -1)
+        pred_i = float(model.predict(x_i)[0])
+        true_i = float(feat.iloc[i][target_col])
+
+        y_true.append(true_i)
+        y_pred.append(pred_i)
+
+        prev_close = float(feat.iloc[i - 1]["Close"]) if i - 1 >= 0 else float(feat.iloc[i]["Close"])
+        if (pred_i - prev_close) * (true_i - prev_close) >= 0:
+            dir_hits += 1
+
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+
+    mae = float(np.mean(np.abs(y_true_arr - y_pred_arr)))
+    mape = float(np.mean(np.abs((y_true_arr - y_pred_arr) / np.maximum(1e-9, np.abs(y_true_arr)))))
+    dir_acc = float(dir_hits / max(1, len(y_true)))
+
+    return {
+        "ok": True,
+        "points": int(len(y_true)),
+        "mae": mae,
+        "mape": mape,
+        "direction_accuracy": dir_acc,
+    }
+
+
+def _tune_params_for_symbol(feat: pd.DataFrame, feature_cols: list[str]) -> dict[str, Any]:
+    """Try a small param grid and pick best by MAPE (then MAE)."""
+    grid = [
+        {"n_estimators": 120, "max_depth": 10, "min_samples_leaf": 2, "max_features": "sqrt"},
+        {"n_estimators": 160, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"},
+        {"n_estimators": 180, "max_depth": 14, "min_samples_leaf": 2, "max_features": "sqrt"},
+        {"n_estimators": 160, "max_depth": 12, "min_samples_leaf": 3, "max_features": "sqrt"},
+    ]
+
+    best = None
+    for p in grid:
+        bt = _walk_forward_backtest(
+            feat=feat,
+            feature_cols=feature_cols,
+            target_col="target_next_close",
+            params=p,
+            max_test_points=40,
+            retrain_every=6,
+        )
+        if not bt.get("ok"):
+            continue
+
+        score = (bt["mape"], bt["mae"])
+        if best is None or score < best["score"]:
+            best = {"params": p, "backtest": bt, "score": score}
+
+    if best is None:
+        return {
+            "params": {"n_estimators": 160, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"},
+            "backtest": {"ok": False, "reason": "tune_failed"},
+        }
+
+    return {
+        "params": best["params"],
+        "backtest": best["backtest"],
+    }
+
+
 def cache_get(cache: dict, key: str, ttl: int):
     now = time.time()
     if key in cache:
@@ -177,7 +292,7 @@ def cache_get(cache: dict, key: str, ttl: int):
     return None
 
 
-def cache_set(cache: dict, key: str, val: dict):
+def cache_set(cache: dict, key: str, val: Any):
     cache[key] = (time.time(), val)
 
 
@@ -251,6 +366,11 @@ def predict(req: PredictRequest):
 
     # Fetch data
     stock_df = get_symbol_df(symbol, tf)
+
+    # Latest date key (used for model/tune caching)
+    last_date = stock_df["Date"].iloc[-1]
+    last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
+
     spy_df = get_symbol_df("SPY", tf)
     qqq_df = get_symbol_df("QQQ", tf)
 
@@ -259,19 +379,30 @@ def predict(req: PredictRequest):
 
     feat = make_features_with_market(stock_df, spy_df, qqq_df)
 
+    # Keep computations fast: use a recent window of feature rows
+    feat = feat.tail(900).reset_index(drop=True)
+
     feature_cols = [
         "ret_1", "ret_5", "ma_5", "ma_10", "vol_10", "volume_ma_10",
         "spy_ret_1", "qqq_ret_1", "rel_spy_1", "rel_qqq_1", "corr_spy_20",
     ]
+
+    # Auto-tune (cached) using walk-forward backtest
+    tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
+    tuned = cache_get(_tune_cache, tune_key, TUNE_CACHE_TTL_SEC)
+    tune_cache_hit = tuned is not None
+    if tuned is None:
+        tuned = _tune_params_for_symbol(feat, feature_cols)
+        cache_set(_tune_cache, tune_key, tuned)
+
+    tuned_params = tuned.get("params") if isinstance(tuned, dict) else None
+    bt_summary = tuned.get("backtest") if isinstance(tuned, dict) else None
 
     X = feat[feature_cols].values
     y = feat["target_next_close"].values
 
     # If we already trained a model for this (symbol, timeframe) and the latest candle
     # hasn't changed, reuse the model to make prediction instant.
-    last_date = stock_df["Date"].iloc[-1]
-    last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
-
     model_key = f"model:{symbol}:{tf}"
     model_cached = cache_get(_model_cache, model_key, MODEL_CACHE_TTL_SEC)
 
@@ -283,14 +414,15 @@ def predict(req: PredictRequest):
         model = None
 
     if not model_cache_hit:
-        # Speed-tuned baseline RF: fewer trees + constrained depth = much faster
+        # Use tuned params if available
+        p = tuned_params or {"n_estimators": 180, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
         model = RandomForestRegressor(
-            n_estimators=220,
+            n_estimators=int(p.get("n_estimators", 180)),
             random_state=42,
             n_jobs=-1,
-            max_depth=12,
-            min_samples_leaf=2,
-            max_features="sqrt",
+            max_depth=p.get("max_depth", 12),
+            min_samples_leaf=p.get("min_samples_leaf", 2),
+            max_features=p.get("max_features", "sqrt"),
         )
         model.fit(X, y)
         cache_set(_model_cache, model_key, {
@@ -335,7 +467,12 @@ def predict(req: PredictRequest):
             "SPY_ret_1": round(spy_ret_1 * 100, 2),  # percent
             "QQQ_ret_1": round(qqq_ret_1 * 100, 2),
         },
-        "cache": {"hit": False, "ttl_sec": PRED_CACHE_TTL_SEC, "model_hit": bool(model_cache_hit)},
+        "backtest": {
+            "method": "walk_forward",
+            "summary": bt_summary,
+            "tune_cache_hit": bool(tune_cache_hit),
+        },
+        "cache": {"hit": False, "ttl_sec": PRED_CACHE_TTL_SEC, "model_hit": bool(model_cache_hit), "tune_hit": bool(tune_cache_hit)},
     }
 
     cache_set(_pred_cache, cache_key, payload)
