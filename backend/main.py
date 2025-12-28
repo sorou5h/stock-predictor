@@ -46,9 +46,14 @@ MODEL_CACHE_TTL_SEC = 60 * 60  # 1 hour
 _model_cache: dict[str, tuple[float, Any]] = {}
 # stored value: {"model": fitted_model, "last_date": "YYYY-MM-DD", "feature_cols": [...]} 
 
- # Tune cache: avoid re-running backtests constantly
+
+# Tune cache: avoid re-running backtests constantly
 TUNE_CACHE_TTL_SEC = 6 * 60 * 60  # 6 hours
 _tune_cache: dict[str, tuple[float, Any]] = {}
+
+# Backtest cache: store evaluation metrics so users don't wait every time
+BACKTEST_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
+_backtest_cache: dict[str, tuple[float, Any]] = {}
 
 # Turn on expensive backtest/tuning only when explicitly enabled
 ENABLE_TUNING = os.getenv("ENABLE_TUNING", "0") == "1"
@@ -337,6 +342,10 @@ def cache_get(cache: dict, key: str, ttl: int):
 def cache_set(cache: dict, key: str, val: Any):
     cache[key] = (time.time(), val)
 
+def _date_key_today_utc() -> str:
+    # Daily cache bucket
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
 
 @app.get("/health")
 def health():
@@ -619,6 +628,88 @@ def forecast(req: ForecastRequest):
     }
 
     cache_set(_forecast_cache, cache_key, payload)
+    return payload
+
+
+# ----------------------------
+# Backtest endpoint (daily-cached)
+# ----------------------------
+
+
+@app.get("/backtest/{symbol}")
+def backtest(symbol: str, timeframe: str = "daily", force: bool = False):
+    """Return cached backtest metrics (auto daily) and allow on-demand recompute.
+
+    - Default: cached for 24 hours per symbol/timeframe/day.
+    - If `force=true`, recompute immediately.
+
+    Uses expanding walk-forward backtest on the current feature set.
+    """
+    symbol = (symbol or "").upper().strip()
+    if not symbol.isalnum():
+        raise HTTPException(status_code=400, detail="Symbol must be letters/numbers only")
+
+    tf = normalize_timeframe(timeframe)
+
+    # Include latest candle date in cache key so new data refreshes naturally
+    stock_df = get_symbol_df(symbol, tf)
+    last_date = stock_df["Date"].iloc[-1]
+    last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
+
+    day_bucket = _date_key_today_utc()
+    cache_key = f"bt:{symbol}:{tf}:{day_bucket}:{last_date_key}"
+
+    if not force:
+        cached = cache_get(_backtest_cache, cache_key, BACKTEST_CACHE_TTL_SEC)
+        if cached is not None:
+            return cached
+
+    spy_df = get_symbol_df("SPY", tf)
+    qqq_df = get_symbol_df("QQQ", tf)
+
+    if len(stock_df) < 180 or len(spy_df) < 180 or len(qqq_df) < 180:
+        raise HTTPException(status_code=400, detail="Not enough history to backtest")
+
+    feat = make_features_with_market(stock_df, spy_df, qqq_df)
+    # Reasonably fast while still meaningful
+    feat = feat.tail(900).reset_index(drop=True)
+
+    feature_cols = get_feature_cols()
+
+    # Default params (fast)
+    params = {"n_estimators": 140, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
+
+    # If tuning enabled, reuse tuned params (still cached)
+    if ENABLE_TUNING:
+        tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
+        tuned = cache_get(_tune_cache, tune_key, TUNE_CACHE_TTL_SEC)
+        if tuned is None:
+            tuned = _tune_params_for_symbol(feat, feature_cols)
+            cache_set(_tune_cache, tune_key, tuned)
+        if isinstance(tuned, dict) and isinstance(tuned.get("params"), dict):
+            params = tuned["params"]
+
+    bt = _walk_forward_backtest(
+        feat=feat,
+        feature_cols=feature_cols,
+        target_col="target_next_close",
+        params=params,
+        max_test_points=50,
+        retrain_every=6,
+    )
+
+    payload = {
+        "symbol": symbol,
+        "timeframe": tf,
+        "as_of": last_date_key,
+        "day_bucket": day_bucket,
+        "ok": bool(bt.get("ok")),
+        "metrics": bt,
+        "params": params,
+        "cache": {"ttl_sec": BACKTEST_CACHE_TTL_SEC, "hit": False, "forced": bool(force)},
+    }
+
+    cache_set(_backtest_cache, cache_key, payload)
     return payload
 
 
