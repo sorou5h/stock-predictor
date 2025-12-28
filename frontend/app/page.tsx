@@ -4,9 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import CandleChart from "../components/CandleChart";
 
 /**
- * testing the save
  * Deployment-ready API base:
- * - Local dev fallback: http://localhost:8000
+ * - Local dev fallback: http://localhost:8001
  * - Vercel prod: set NEXT_PUBLIC_API_BASE_URL to your Render backend URL
  */
 const API_BASE =
@@ -60,6 +59,23 @@ type NewsResponse = {
   source: string;
 };
 
+function Skeleton({ className = "" }: { className?: string }) {
+  return (
+    <div
+      className={`animate-pulse rounded-lg bg-zinc-800/60 ${className}`}
+      aria-hidden="true"
+    />
+  );
+}
+
+function fmtMoney(n: number) {
+  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function clamp01(x: number) {
+  return Math.max(0, Math.min(1, x));
+}
+
 export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
   const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
@@ -69,12 +85,20 @@ export default function Home() {
   const [hist, setHist] = useState<HistoryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const [backendOk, setBackendOk] = useState<boolean | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+
   const [newsTab, setNewsTab] = useState<"market" | "ticker">("market");
   const [newsLoading, setNewsLoading] = useState(false);
   const [newsError, setNewsError] = useState<string | null>(null);
   const [news, setNews] = useState<NewsResponse | null>(null);
 
   const candles = useMemo(() => hist?.candles ?? [], [hist]);
+
+  useEffect(() => {
+    const t = hist?.candles?.[hist.candles.length - 1]?.time;
+    setLastUpdated(t ?? null);
+  }, [hist]);
 
   async function loadNews(tab: "market" | "ticker", sym: string) {
     const s = sym.trim().toUpperCase();
@@ -104,7 +128,10 @@ export default function Home() {
 
   // Warm up backend + load initial market news
   useEffect(() => {
-    fetch(`${API_BASE}/health`).catch(() => {});
+    fetch(`${API_BASE}/health`)
+      .then((r) => setBackendOk(r.ok))
+      .catch(() => setBackendOk(false));
+
     loadNews("market", symbol);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -223,6 +250,23 @@ export default function Home() {
             Forecasting demo using free market data + baseline ML with market
             context (SPY/QQQ). Not financial advice.
           </p>
+          <div className="mt-2 flex flex-wrap gap-2 text-xs">
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Backend: {backendOk === null ? "checking…" : backendOk ? "online" : "offline"}
+            </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Data: {pred?.source ?? "stooq"}
+            </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Mode: {timeframe}
+            </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Updated: {lastUpdated ?? "—"}
+            </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Cache: {pred?.cache?.hit ? "hit" : pred ? "miss" : "—"}
+            </span>
+          </div>
         </header>
 
         <section className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -253,12 +297,13 @@ export default function Home() {
                   {loading ? "Running..." : "Predict"}
                 </button>
               </div>
-              {loading && (
-                <div className="mt-3 text-sm text-zinc-400">
-                  {loadingMsg ?? "Working…"}
-                </div>
-              )}
             </div>
+
+            {loading && (
+              <div className="mt-3 text-sm text-zinc-400">
+                {loadingMsg ?? "Working…"}
+              </div>
+            )}
 
             {error && (
               <div className="mt-4 rounded-xl border border-red-800 bg-red-950/40 p-4 text-sm text-red-200">
@@ -266,6 +311,67 @@ export default function Home() {
               </div>
             )}
 
+            {/* Key stats */}
+            <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+              {loading ? (
+                <>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                    <Skeleton className="h-3 w-20" />
+                    <Skeleton className="mt-2 h-6 w-24" />
+                  </div>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                    <Skeleton className="h-3 w-24" />
+                    <Skeleton className="mt-2 h-6 w-28" />
+                  </div>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                    <Skeleton className="h-3 w-16" />
+                    <Skeleton className="mt-2 h-6 w-20" />
+                  </div>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                    <Skeleton className="h-3 w-20" />
+                    <Skeleton className="mt-2 h-2 w-full" />
+                    <Skeleton className="mt-2 h-3 w-12" />
+                  </div>
+                </>
+              ) : pred ? (
+                <>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                    <div className="text-xs text-zinc-500">Last close</div>
+                    <div className="mt-1 text-lg font-semibold">${fmtMoney(pred.last_close)}</div>
+                  </div>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                    <div className="text-xs text-zinc-500">Predicted next</div>
+                    <div className="mt-1 text-lg font-semibold">${fmtMoney(pred.prediction)}</div>
+                  </div>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                    <div className="text-xs text-zinc-500">Change</div>
+                    <div className="mt-1 text-lg font-semibold">
+                      {changePct === null ? "—" : (
+                        <span className={changePct >= 0 ? "text-emerald-200" : "text-red-200"}>
+                          {changePct >= 0 ? "+" : ""}{changePct.toFixed(2)}%
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                    <div className="text-xs text-zinc-500">Confidence</div>
+                    <div className="mt-2 h-2 w-full rounded-full bg-zinc-800">
+                      <div
+                        className="h-2 rounded-full bg-zinc-200"
+                        style={{ width: `${clamp01(pred.confidence) * 100}%` }}
+                      />
+                    </div>
+                    <div className="mt-2 text-xs text-zinc-400">
+                      {(pred.confidence * 100).toFixed(0)}%
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="col-span-2 md:col-span-4 rounded-xl border border-zinc-800 bg-zinc-950 p-3 text-sm text-zinc-500">
+                  Run a prediction to populate key stats.
+                </div>
+              )}
+            </div>
             {/* Market context row */}
             <div className="mt-4 flex flex-wrap gap-2 text-xs text-zinc-300">
               <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
@@ -296,7 +402,7 @@ export default function Home() {
             <div className="mt-4 h-[340px] min-w-0 w-full rounded-2xl border border-zinc-800 bg-zinc-950 p-3">
               {candles.length === 0 ? (
                 <div className="h-full flex items-center justify-center text-sm text-zinc-500">
-                  Run a prediction to load candlestick chart
+                  Run a prediction to load the candlestick chart (last 200 candles).
                 </div>
               ) : (
                 <CandleChart
@@ -369,6 +475,26 @@ export default function Home() {
                   Model: RandomForest baseline (with SPY/QQQ context) • Trained on{" "}
                   {pred.data_points} candles
                 </div>
+                <details className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <summary className="cursor-pointer text-sm text-zinc-200 select-none">
+                    About this prediction
+                  </summary>
+                  <div className="mt-3 space-y-3 text-sm text-zinc-400">
+                    <p>
+                      This is a demo model trained on historical candles using technical features
+                      (returns, moving averages, volatility, volume signals) plus market context
+                      from SPY and QQQ.
+                    </p>
+                    <ul className="space-y-1">
+                      <li>• Daily = next trading day close</li>
+                      <li>• Weekly = next weekly close (aggregated candles)</li>
+                      <li>• Confidence is a rough stability score, not a guarantee</li>
+                    </ul>
+                    <p className="text-xs text-zinc-500">
+                      Not financial advice.
+                    </p>
+                  </div>
+                </details>
               </div>
             )}
           </div>
@@ -416,9 +542,15 @@ export default function Home() {
           <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="md:col-span-2 space-y-3">
               {newsLoading ? (
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm text-zinc-400">
-                  Loading news…
-                </div>
+                <>
+                  {[0, 1, 2].map((k) => (
+                    <div key={k} className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+                      <Skeleton className="h-4 w-40" />
+                      <Skeleton className="mt-3 h-4 w-full" />
+                      <Skeleton className="mt-2 h-4 w-5/6" />
+                    </div>
+                  ))}
+                </>
               ) : (news?.items?.length ?? 0) === 0 ? (
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm text-zinc-500">
                   No news items.
