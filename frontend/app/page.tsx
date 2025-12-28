@@ -162,7 +162,7 @@ export default function Home() {
       setSymbolsLoading(true);
       setSymbolsError(null);
       try {
-        const res = await fetch(`${API_BASE}/symbols/sp500?limit=600`);
+        const res = await fetch(`${API_BASE}/symbols/sp500?limit=2000`);
         if (!res.ok) throw new Error(`Symbols API error: ${res.status}`);
         const json = (await res.json()) as SymbolsResponse;
         setSymbols(json.items ?? []);
