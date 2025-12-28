@@ -33,6 +33,9 @@ PRED_CACHE_TTL_SEC = 15 * 60  # 15 minutes
 HIST_CACHE_TTL_SEC = 15 * 60
 _pred_cache: dict[str, tuple[float, dict]] = {}
 _hist_cache: dict[str, tuple[float, dict]] = {}
+# Forecast cache: multi-horizon forecasts
+FORECAST_CACHE_TTL_SEC = 15 * 60  # 15 minutes
+_forecast_cache: dict[str, tuple[float, dict]] = {}
 
 # Data cache: avoid re-downloading the same CSV repeatedly
 DATA_CACHE_TTL_SEC = 15 * 60  # 15 minutes
@@ -56,9 +59,16 @@ SYMBOLS_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
 _symbols_cache: dict[str, tuple[float, dict]] = {}
 
 
+
 class PredictRequest(BaseModel):
     symbol: str
     timeframe: str = "daily"  # "daily" or "weekly"
+
+
+class ForecastRequest(BaseModel):
+    symbol: str
+    timeframe: str = "daily"  # "daily" or "weekly"
+    horizons: list[int] | None = None  # e.g. [1,3,5]
 
 
 def normalize_timeframe(tf: str) -> str:
@@ -66,6 +76,35 @@ def normalize_timeframe(tf: str) -> str:
     if tf not in ("daily", "weekly"):
         raise HTTPException(status_code=400, detail="timeframe must be daily or weekly")
     return tf
+
+
+def default_horizons(tf: str) -> list[int]:
+    # Keep it small (fast + understandable)
+    return [1, 3, 5] if tf == "daily" else [1, 2, 4]
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def get_feature_cols() -> list[str]:
+    # Must match columns produced by make_features_with_market()
+    return [
+        "ret_1", "ret_5", "ma_5", "ma_10", "vol_10", "volume_ma_10",
+        "spy_ret_1", "qqq_ret_1", "rel_spy_1", "rel_qqq_1", "corr_spy_20",
+    ]
+
+
+def build_rf(params: dict | None = None) -> RandomForestRegressor:
+    p = params or {}
+    return RandomForestRegressor(
+        n_estimators=int(p.get("n_estimators", 180)),
+        random_state=42,
+        n_jobs=-1,
+        max_depth=p.get("max_depth", 12),
+        min_samples_leaf=p.get("min_samples_leaf", 2),
+        max_features=p.get("max_features", "sqrt"),
+    )
 
 
 def fetch_stooq_ohlcv(symbol: str) -> pd.DataFrame:
@@ -382,10 +421,7 @@ def predict(req: PredictRequest):
     # Keep computations fast: use a recent window of feature rows
     feat = feat.tail(900).reset_index(drop=True)
 
-    feature_cols = [
-        "ret_1", "ret_5", "ma_5", "ma_10", "vol_10", "volume_ma_10",
-        "spy_ret_1", "qqq_ret_1", "rel_spy_1", "rel_qqq_1", "corr_spy_20",
-    ]
+    feature_cols = get_feature_cols()
 
     # Auto-tune (cached) using walk-forward backtest
     tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
@@ -476,6 +512,132 @@ def predict(req: PredictRequest):
     }
 
     cache_set(_pred_cache, cache_key, payload)
+    return payload
+
+
+# ----------------------------
+# Multi-horizon forecast endpoint
+# ----------------------------
+
+@app.post("/forecast")
+def forecast(req: ForecastRequest):
+    """Multi-horizon forecast for the selected timeframe.
+
+    Returns multiple predicted closes for future horizons.
+    Daily default horizons: 1D, 3D, 5D
+    Weekly default horizons: 1W, 2W, 4W
+    """
+    symbol = (req.symbol or "").upper().strip()
+    if not symbol.isalnum():
+        raise HTTPException(status_code=400, detail="Symbol must be letters/numbers only (e.g., AAPL)")
+
+    tf = normalize_timeframe(req.timeframe)
+
+    # Sanitize horizons
+    horizons = req.horizons or default_horizons(tf)
+    try:
+        horizons = [int(h) for h in horizons]
+    except Exception:
+        horizons = default_horizons(tf)
+
+    horizons = [h for h in horizons if 1 <= h <= 20]
+    horizons = sorted(list(dict.fromkeys(horizons)))
+    if not horizons:
+        horizons = default_horizons(tf)
+
+    # Fetch data
+    stock_df = get_symbol_df(symbol, tf)
+    last_date = stock_df["Date"].iloc[-1]
+    last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
+
+    cache_key = f"{symbol}:{tf}:{last_date_key}:{','.join(str(h) for h in horizons)}"
+    cached = cache_get(_forecast_cache, cache_key, FORECAST_CACHE_TTL_SEC)
+    if cached is not None:
+        return cached
+
+    spy_df = get_symbol_df("SPY", tf)
+    qqq_df = get_symbol_df("QQQ", tf)
+
+    if len(stock_df) < 160 or len(spy_df) < 160 or len(qqq_df) < 160:
+        raise HTTPException(status_code=400, detail="Not enough history to forecast")
+
+    feat = make_features_with_market(stock_df, spy_df, qqq_df)
+    feat = feat.tail(900).reset_index(drop=True)
+
+    feature_cols = get_feature_cols()
+
+    # Reuse tuned params if we have them
+    tune_key = f"tune:{symbol}:{tf}:{last_date_key}"
+    tuned = cache_get(_tune_cache, tune_key, TUNE_CACHE_TTL_SEC)
+    tuned_params = tuned.get("params") if isinstance(tuned, dict) else None
+
+    last_close = float(stock_df["Close"].iloc[-1])
+
+    # Simple volatility estimate for bands
+    vol = float(feat["ret_1"].std()) if "ret_1" in feat.columns else 0.02
+    if not np.isfinite(vol) or vol <= 0:
+        vol = 0.02
+
+    items: list[dict[str, Any]] = []
+
+    for h in horizons:
+        dfh = feat.copy()
+        dfh["target_h"] = dfh["Close"].shift(-h)
+        dfh = dfh.dropna().reset_index(drop=True)
+
+        if len(dfh) < 140:
+            continue
+
+        X = dfh[feature_cols].values
+        y = dfh["target_h"].values
+
+        model = build_rf(tuned_params)
+        model.fit(X, y)
+
+        x_last = feat.iloc[-1][feature_cols].values.reshape(1, -1)
+        pred_h = float(model.predict(x_last)[0])
+
+        # Uncertainty band grows with sqrt(h)
+        band = last_close * vol * (h ** 0.5) * 1.25
+        range_low = float(pred_h - band)
+        range_high = float(pred_h + band)
+
+        change_pct = ((pred_h - last_close) / last_close) * 100 if last_close else 0.0
+
+        # Confidence decays with horizon and volatility
+        conf = clamp(1.0 - (abs(vol) * (h ** 0.5) * 6.0), 0.05, 0.95)
+
+        items.append({
+            "horizon": int(h),
+            "prediction": round(pred_h, 2),
+            "range_low": round(range_low, 2),
+            "range_high": round(range_high, 2),
+            "change_pct": round(change_pct, 2),
+            "confidence": round(conf, 2),
+        })
+
+    # If for some reason we couldn't produce anything, return a safe response
+    if not items:
+        items = [{
+            "horizon": 1,
+            "prediction": round(last_close, 2),
+            "range_low": round(last_close, 2),
+            "range_high": round(last_close, 2),
+            "change_pct": 0.0,
+            "confidence": 0.1,
+        }]
+
+    payload = {
+        "symbol": symbol,
+        "timeframe": tf,
+        "last_close": round(last_close, 2),
+        "as_of": last_date_key,
+        "horizons": items,
+        "source": "stooq",
+        "cache": {"ttl_sec": FORECAST_CACHE_TTL_SEC},
+    }
+
+    cache_set(_forecast_cache, cache_key, payload)
     return payload
 
 
