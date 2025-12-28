@@ -626,16 +626,39 @@ def news(mode: str = "market", symbol: str | None = None, limit: int = 6):
 # ----------------------------
 
 def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
-    """Fetch S&P 500 constituents from a free CSV dataset.
+    """Fetch S&P 500 constituents from free CSV sources (no API key).
 
-    This avoids HTML parsing dependencies that can fail on some hosts.
+    Some hosts block certain domains; we try multiple mirrors.
     """
-    url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+    urls = [
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+        "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv",
+        "https://raw.fastgit.org/datasets/s-and-p-500-companies/master/data/constituents.csv",
+    ]
 
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
+    last_err = None
+    text = None
 
-    df = pd.read_csv(StringIO(r.text))
+    headers = {
+        "User-Agent": "stock-predictor/1.0 (+https://example.com)",
+        "Accept": "text/csv,*/*;q=0.9",
+    }
+
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=25, headers=headers)
+            r.raise_for_status()
+            if r.text and len(r.text) > 2000 and "Symbol" in r.text and "," in r.text:
+                text = r.text
+                break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+
+    if text is None:
+        raise RuntimeError(f"SP500 CSV fetch failed. Last error: {last_err}")
+
+    df = pd.read_csv(StringIO(text))
 
     # Expected columns: Symbol, Name, Sector
     cols = {str(c).lower(): c for c in df.columns}
@@ -644,12 +667,14 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
     sector_col = cols.get("sector")
 
     if not sym_col or not name_col:
-        raise RuntimeError("Unexpected CSV schema for S&P 500 constituents")
+        raise RuntimeError(f"Unexpected CSV schema for S&P 500 constituents: {list(df.columns)}")
 
     out: list[dict[str, Any]] = []
     for _, row in df.iterrows():
         sym = str(row[sym_col]).strip().upper()
-        sym_alt = sym.replace(".", "-")  # BRK.B -> BRK-B (often needed)
+        if not sym:
+            continue
+        sym_alt = sym.replace(".", "-")  # BRK.B -> BRK-B
 
         name = str(row[name_col]).strip()
         sector = str(row[sector_col]).strip() if sector_col else ""
@@ -669,6 +694,10 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
             continue
         seen.add(it["symbol"])
         dedup.append(it)
+
+    # Sanity check
+    if len(dedup) < 400:
+        raise RuntimeError(f"SP500 list too small ({len(dedup)}). Source likely blocked/corrupt.")
 
     return dedup
 
@@ -695,10 +724,12 @@ def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
                 except Exception:
                     pass
 
+    fetch_error = None
     try:
         items = _fetch_sp500_from_free_csv()
         source = "free_csv"
-    except Exception:
+    except Exception as e:
+        fetch_error = f"{type(e).__name__}: {e}"
         # Fallback if CSV is temporarily unavailable
         items = [
             {"symbol": "AAPL", "symbol_alt": None, "name": "Apple Inc.", "sector": "Information Technology"},
@@ -718,6 +749,7 @@ def symbols_sp500(limit: int = 2000, force_refresh: bool = False):
         "source": source,
         "cache_ttl_sec": SYMBOLS_CACHE_TTL_SEC,
         "count": len(items_out),
+        "error": fetch_error if source == "fallback" else None,
     }
     # Cache: good data for 24h, fallback for 60s
     if source == "fallback":
