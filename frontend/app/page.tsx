@@ -84,11 +84,30 @@ type SymbolItem = {
   sector?: string;
 };
 
+
 type SymbolsResponse = {
   items: SymbolItem[];
   source: string;
   count: number;
   cache_ttl_sec: number;
+};
+
+type BacktestResponse = {
+  symbol: string;
+  timeframe: "daily" | "weekly";
+  as_of: string;
+  day_bucket: string;
+  ok: boolean;
+  metrics: {
+    ok: boolean;
+    points?: number;
+    mae?: number;
+    mape?: number;
+    direction_accuracy?: number;
+    reason?: string;
+  };
+  params: Record<string, any>;
+  cache?: { ttl_sec: number; hit?: boolean; forced?: boolean };
 };
 
 function Skeleton({ className = "" }: { className?: string }) {
@@ -116,6 +135,11 @@ export default function Home() {
   const [pred, setPred] = useState<PredictResponse | null>(null);
   const [hist, setHist] = useState<HistoryResponse | null>(null);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
+
+  // Backtest (accuracy)
+  const [bt, setBt] = useState<BacktestResponse | null>(null);
+  const [btLoading, setBtLoading] = useState(false);
+  const [btError, setBtError] = useState<string | null>(null);
 
   // Live price ticker
   const [livePrice, setLivePrice] = useState<number | null>(null);
@@ -238,6 +262,9 @@ export default function Home() {
     // Refresh ticker immediately
     fetchLiveQuote(s);
 
+    // Auto-check accuracy (daily cached)
+    runBacktest(false, s);
+
     setLoading(true);
     setError(null);
 
@@ -299,6 +326,7 @@ export default function Home() {
       setPred(null);
       setHist(null);
       setForecast(null);
+      setBt(null);
     } finally {
       // Keep the message visible briefly so it doesn't flash too fast
       const elapsed = Date.now() - startedAt;
@@ -310,6 +338,30 @@ export default function Home() {
       clearInterval(timer);
       setLoading(false);
       setLoadingMsg(null);
+    }
+  }
+
+  async function runBacktest(force = false, symRaw?: string) {
+    const s = (symRaw ?? symbol).trim().toUpperCase();
+    if (!s) return;
+
+    setBtLoading(true);
+    setBtError(null);
+
+    try {
+      const res = await fetch(
+        `${API_BASE}/backtest/${encodeURIComponent(s)}?timeframe=${timeframe}&force=${force ? "true" : "false"}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) throw new Error(`Backtest API error: ${res.status}`);
+
+      const json = (await res.json()) as BacktestResponse;
+      setBt(json);
+    } catch (e: any) {
+      setBt(null);
+      setBtError(e?.message ?? "Backtest failed");
+    } finally {
+      setBtLoading(false);
     }
   }
 
@@ -863,6 +915,78 @@ export default function Home() {
                     This breakdown is a simple explanation based on model inputs (market context + recent price behavior). It helps interpret the output,
                     but it does not prove causation.
                   </p>
+                </div>
+
+                {/* Accuracy / Backtest */}
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs text-zinc-500">Accuracy (walk-forward backtest)</div>
+                      <div className="mt-1 text-[11px] text-zinc-600">
+                        Auto cached daily • Use “Rerun now” for a fresh (slower) test
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => runBacktest(false)}
+                        disabled={btLoading}
+                        className="rounded-xl px-3 py-1.5 bg-zinc-100 text-zinc-900 text-xs font-medium hover:bg-white disabled:opacity-60"
+                        title="Fetch cached backtest (daily)"
+                      >
+                        {btLoading ? "Checking…" : "Evaluate"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => runBacktest(true)}
+                        disabled={btLoading}
+                        className="rounded-xl px-3 py-1.5 border border-zinc-700 bg-zinc-900/40 text-xs text-zinc-200 hover:bg-zinc-900 disabled:opacity-60"
+                        title="Force recompute now (slower)"
+                      >
+                        Rerun now
+                      </button>
+                    </div>
+                  </div>
+
+                  {btError ? (
+                    <div className="mt-3 text-sm text-red-200">{btError}</div>
+                  ) : null}
+
+                  {!bt ? (
+                    <div className="mt-3 text-sm text-zinc-500">
+                      Run Predict (or Evaluate) to see historical accuracy.
+                    </div>
+                  ) : bt.metrics?.ok ? (
+                    <div className="mt-3 grid grid-cols-2 gap-2">
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">Direction accuracy</div>
+                        <div className="mt-1 text-sm font-semibold">
+                          {((bt.metrics.direction_accuracy ?? 0) * 100).toFixed(1)}%
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">MAPE</div>
+                        <div className="mt-1 text-sm font-semibold">
+                          {(((bt.metrics.mape ?? 0) * 100)).toFixed(2)}%
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">MAE</div>
+                        <div className="mt-1 text-sm font-semibold">${fmtMoney(bt.metrics.mae ?? 0)}</div>
+                      </div>
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">Test points</div>
+                        <div className="mt-1 text-sm font-semibold">{bt.metrics.points ?? "—"}</div>
+                      </div>
+                      <div className="col-span-2 mt-1 text-[11px] text-zinc-500">
+                        As of {bt.as_of} • Cache bucket {bt.day_bucket}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-3 text-sm text-zinc-500">
+                      Backtest unavailable: {bt.metrics?.reason ?? "unknown"}
+                    </div>
+                  )}
                 </div>
 
                 <div className="text-xs text-zinc-500">
