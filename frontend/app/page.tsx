@@ -372,8 +372,8 @@ export default function Home() {
           </div>
         </header>
 
-        <section className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="md:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
+        <section className="mt-6 grid grid-cols-1 md:grid-cols-5 gap-4">
+          <div className="md:col-span-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-3 w-full">
                 <div className="relative flex-1">
@@ -590,7 +590,7 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
+          <div className="md:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <h2 className="text-sm font-medium text-zinc-300">Forecast</h2>
 
             {!pred ? (
