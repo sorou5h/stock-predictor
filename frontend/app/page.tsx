@@ -59,6 +59,20 @@ type NewsResponse = {
   source: string;
 };
 
+type SymbolItem = {
+  symbol: string;
+  symbol_alt?: string | null;
+  name: string;
+  sector?: string;
+};
+
+type SymbolsResponse = {
+  items: SymbolItem[];
+  source: string;
+  count: number;
+  cache_ttl_sec: number;
+};
+
 function Skeleton({ className = "" }: { className?: string }) {
   return (
     <div
@@ -93,12 +107,23 @@ export default function Home() {
   const [newsError, setNewsError] = useState<string | null>(null);
   const [news, setNews] = useState<NewsResponse | null>(null);
 
+  const [symbols, setSymbols] = useState<SymbolItem[]>([]);
+  const [symbolsLoading, setSymbolsLoading] = useState(false);
+  const [symbolsError, setSymbolsError] = useState<string | null>(null);
+
+  const [symbolQuery, setSymbolQuery] = useState("AAPL");
+  const [comboOpen, setComboOpen] = useState(false);
+
   const candles = useMemo(() => hist?.candles ?? [], [hist]);
 
   useEffect(() => {
     const t = hist?.candles?.[hist.candles.length - 1]?.time;
     setLastUpdated(t ?? null);
   }, [hist]);
+
+  useEffect(() => {
+    setSymbolQuery(symbol);
+  }, [symbol]);
 
   async function loadNews(tab: "market" | "ticker", sym: string) {
     const s = sym.trim().toUpperCase();
@@ -126,15 +151,46 @@ export default function Home() {
     }
   }
 
-  // Warm up backend + load initial market news
+  // Warm up backend + load initial market news + S&P 500 symbol list
   useEffect(() => {
     fetch(`${API_BASE}/health`)
       .then((r) => setBackendOk(r.ok))
       .catch(() => setBackendOk(false));
 
+    // Load S&P 500 symbols for searchable dropdown
+    (async () => {
+      setSymbolsLoading(true);
+      setSymbolsError(null);
+      try {
+        const res = await fetch(`${API_BASE}/symbols/sp500?limit=600`);
+        if (!res.ok) throw new Error(`Symbols API error: ${res.status}`);
+        const json = (await res.json()) as SymbolsResponse;
+        setSymbols(json.items ?? []);
+      } catch (e: any) {
+        setSymbolsError(e?.message ?? "Failed to load symbols");
+        setSymbols([]);
+      } finally {
+        setSymbolsLoading(false);
+      }
+    })();
+
     loadNews("market", symbol);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  const filteredSymbols = useMemo(() => {
+    const q = symbolQuery.trim().toLowerCase();
+    if (!q) return symbols.slice(0, 25);
+
+    const matches = symbols.filter((it) => {
+      return (
+        it.symbol.toLowerCase().includes(q) ||
+        (it.symbol_alt ?? "").toLowerCase().includes(q) ||
+        it.name.toLowerCase().includes(q)
+      );
+    });
+
+    return matches.slice(0, 25);
+  }, [symbols, symbolQuery]);
 
   // When tab changes, reload news for the active tab
   useEffect(() => {
@@ -273,12 +329,72 @@ export default function Home() {
           <div className="md:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-3 w-full">
-                <input
-                  className="flex-1 rounded-xl bg-zinc-950 border border-zinc-800 px-4 py-3 outline-none focus:ring-2 focus:ring-zinc-600"
-                  value={symbol}
-                  onChange={(e) => setSymbol(e.target.value)}
-                  placeholder="Ticker (e.g., AAPL)"
-                />
+                <div className="relative flex-1">
+                  <input
+                    className="w-full rounded-xl bg-zinc-950 border border-zinc-800 px-4 py-3 outline-none focus:ring-2 focus:ring-zinc-600"
+                    value={symbolQuery}
+                    onChange={(e) => {
+                      setSymbolQuery(e.target.value);
+                      setComboOpen(true);
+                    }}
+                    onFocus={() => setComboOpen(true)}
+                    onBlur={() => {
+                      // small delay so click selection works
+                      setTimeout(() => setComboOpen(false), 150);
+                      // keep symbol in sync with what user typed (manual fallback)
+                      setSymbol(symbolQuery.trim().toUpperCase());
+                    }}
+                    placeholder={symbolsLoading ? "Loading S&P 500…" : "Search S&P 500 (e.g., Apple or AAPL)"}
+                    aria-label="Search ticker"
+                  />
+
+                  {comboOpen && (
+                    <div className="absolute z-20 mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-950 shadow-lg overflow-hidden">
+                      <div className="max-h-72 overflow-auto">
+                        {symbolsError ? (
+                          <div className="p-3 text-sm text-red-200">{symbolsError}</div>
+                        ) : symbolsLoading ? (
+                          <div className="p-3 text-sm text-zinc-400">Loading symbols…</div>
+                        ) : filteredSymbols.length === 0 ? (
+                          <div className="p-3 text-sm text-zinc-500">No matches. You can still type a ticker manually.</div>
+                        ) : (
+                          filteredSymbols.map((it) => (
+                            <button
+                              key={it.symbol}
+                              type="button"
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => {
+                                // Prefer symbol_alt for providers that use '-' instead of '.'
+                                const pick = (it.symbol_alt ?? it.symbol).toUpperCase();
+                                setSymbol(pick);
+                                setSymbolQuery(pick);
+                                setComboOpen(false);
+                              }}
+                              className="w-full text-left px-4 py-3 hover:bg-zinc-900/60 border-b border-zinc-900/50 last:border-b-0"
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="text-sm font-semibold text-zinc-100 truncate">
+                                    {it.symbol_alt ?? it.symbol}
+                                    <span className="ml-2 text-xs font-normal text-zinc-400 truncate">{it.name}</span>
+                                  </div>
+                                  {it.sector ? (
+                                    <div className="mt-1 text-xs text-zinc-500 truncate">{it.sector}</div>
+                                  ) : null}
+                                </div>
+                                <span className="text-xs text-zinc-400">Select</span>
+                              </div>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="mt-1 text-[11px] text-zinc-500">
+                    {symbolsLoading ? "Loading symbols…" : `Pick from S&P 500 or type any ticker manually.`}
+                  </div>
+                </div>
 
                 <select
                   className="rounded-xl bg-zinc-950 border border-zinc-800 px-3 py-3 outline-none focus:ring-2 focus:ring-zinc-600"
