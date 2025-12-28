@@ -660,14 +660,19 @@ def _fetch_sp500_from_free_csv() -> list[dict[str, Any]]:
 
     df = pd.read_csv(StringIO(text))
 
-    # Expected columns: Symbol, Name, Sector
-    cols = {str(c).lower(): c for c in df.columns}
+    # Accept multiple common schemas:
+    # - datasets/s-and-p-500-companies: Symbol, Name, Sector
+    # - wikipedia exports: Symbol, Security, GICS Sector, ...
+    cols = {str(c).strip().lower(): c for c in df.columns}
+
     sym_col = cols.get("symbol")
-    name_col = cols.get("name")
-    sector_col = cols.get("sector")
+    name_col = cols.get("name") or cols.get("security")
+    sector_col = cols.get("sector") or cols.get("gics sector")
 
     if not sym_col or not name_col:
-        raise RuntimeError(f"Unexpected CSV schema for S&P 500 constituents: {list(df.columns)}")
+        raise RuntimeError(
+            f"Unexpected CSV schema for S&P 500 constituents: {list(df.columns)}"
+        )
 
     out: list[dict[str, Any]] = []
     for _, row in df.iterrows():
