@@ -7,7 +7,6 @@ import numpy as np
 import requests
 from io import StringIO
 from sklearn.ensemble import RandomForestRegressor
-from fastapi.middleware.cors import CORSMiddleware
 import time
 
 # News endpoint imports
@@ -35,6 +34,15 @@ HIST_CACHE_TTL_SEC = 15 * 60
 _pred_cache: dict[str, tuple[float, dict]] = {}
 _hist_cache: dict[str, tuple[float, dict]] = {}
 
+# Data cache: avoid re-downloading the same CSV repeatedly
+DATA_CACHE_TTL_SEC = 15 * 60  # 15 minutes
+_data_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+
+# Model cache: avoid retraining if the latest candle hasn't changed
+MODEL_CACHE_TTL_SEC = 60 * 60  # 1 hour
+_model_cache: dict[str, tuple[float, Any]] = {}
+# stored value: {"model": fitted_model, "last_date": "YYYY-MM-DD", "feature_cols": [...]} 
+
 # News cache
 NEWS_CACHE_TTL_SEC = 10 * 60  # 10 minutes
 _news_cache: dict[str, tuple[float, dict]] = {}
@@ -61,6 +69,13 @@ def fetch_stooq_ohlcv(symbol: str) -> pd.DataFrame:
     Fetch DAILY OHLCV data from Stooq (free, no API key).
     Returns columns: Date, Open, High, Low, Close, Volume
     """
+    # Cache by symbol for a short time so repeat requests are fast
+    cache_key = f"stooq:{symbol.lower().strip()}:daily"
+    cached = cache_get(_data_cache, cache_key, DATA_CACHE_TTL_SEC)
+    if cached is not None:
+        # return a copy so callers can safely modify
+        return cached.copy()
+
     s = symbol.lower().strip()
     url = f"https://stooq.com/q/d/l/?s={s}.us&i=d"
 
@@ -78,6 +93,7 @@ def fetch_stooq_ohlcv(symbol: str) -> pd.DataFrame:
           .dropna(subset=["Open", "High", "Low", "Close", "Volume"])
           .reset_index(drop=True)
     )
+    cache_set(_data_cache, cache_key, df)
     return df
 
 
@@ -251,12 +267,37 @@ def predict(req: PredictRequest):
     X = feat[feature_cols].values
     y = feat["target_next_close"].values
 
-    model = RandomForestRegressor(
-        n_estimators=400,
-        random_state=42,
-        n_jobs=-1
-    )
-    model.fit(X, y)
+    # If we already trained a model for this (symbol, timeframe) and the latest candle
+    # hasn't changed, reuse the model to make prediction instant.
+    last_date = stock_df["Date"].iloc[-1]
+    last_date_key = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
+
+    model_key = f"model:{symbol}:{tf}"
+    model_cached = cache_get(_model_cache, model_key, MODEL_CACHE_TTL_SEC)
+
+    model_cache_hit = False
+    if isinstance(model_cached, dict) and model_cached.get("last_date") == last_date_key:
+        model = model_cached.get("model")
+        model_cache_hit = model is not None
+    else:
+        model = None
+
+    if not model_cache_hit:
+        # Speed-tuned baseline RF: fewer trees + constrained depth = much faster
+        model = RandomForestRegressor(
+            n_estimators=220,
+            random_state=42,
+            n_jobs=-1,
+            max_depth=12,
+            min_samples_leaf=2,
+            max_features="sqrt",
+        )
+        model.fit(X, y)
+        cache_set(_model_cache, model_key, {
+            "model": model,
+            "last_date": last_date_key,
+            "feature_cols": feature_cols,
+        })
 
     latest = feat.iloc[-1]
     pred_next_close = float(model.predict(latest[feature_cols].values.reshape(1, -1))[0])
@@ -294,7 +335,7 @@ def predict(req: PredictRequest):
             "SPY_ret_1": round(spy_ret_1 * 100, 2),  # percent
             "QQQ_ret_1": round(qqq_ret_1 * 100, 2),
         },
-        "cache": {"hit": False, "ttl_sec": PRED_CACHE_TTL_SEC},
+        "cache": {"hit": False, "ttl_sec": PRED_CACHE_TTL_SEC, "model_hit": bool(model_cache_hit)},
     }
 
     cache_set(_pred_cache, cache_key, payload)
