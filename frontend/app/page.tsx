@@ -778,6 +778,18 @@ export default function Home() {
                 ? "online"
                 : "offline"}
             </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Data: {pred?.source ?? "—"}
+            </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Mode: {timeframe}
+            </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Updated: {lastUpdated ?? "—"}
+            </span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Cache: {pred?.cache?.hit ? "hit" : pred ? "miss" : "—"}
+            </span>
             <div className="flex items-center gap-2 px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               <span className="text-zinc-400">Asset:</span>
 
@@ -807,18 +819,6 @@ export default function Home() {
                 }}
               />
             </div>
-            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Data: {pred?.source ?? "—"}
-            </span>
-            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Mode: {timeframe}
-            </span>
-            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Updated: {lastUpdated ?? "—"}
-            </span>
-            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Cache: {pred?.cache?.hit ? "hit" : pred ? "miss" : "—"}
-            </span>
           </div>
 
           <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
