@@ -141,6 +141,15 @@ function fmtMoney(n: number) {
   });
 }
 
+function fmtVol(n: number) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  return new Intl.NumberFormat(undefined, {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(v);
+}
+
 function SegmentedToggle({
   value,
   onChange,
@@ -1483,21 +1492,33 @@ export default function Home() {
                     <div className="mt-3 text-sm text-zinc-500">No candle history yet.</div>
                   ) : (
                     <div className="mt-3 overflow-hidden rounded-lg border border-zinc-800">
-                      <div className="grid grid-cols-5 bg-zinc-900/30 text-[11px] text-zinc-500 px-3 py-2">
-                        <div className="col-span-2">Time</div>
-                        <div className="text-right">O</div>
-                        <div className="text-right">C</div>
-                        <div className="text-right">Vol</div>
+                      {/* Header */}
+                      <div className="grid grid-cols-[minmax(0,1fr)_120px_120px_84px] bg-zinc-900/30 text-[11px] text-zinc-500 px-3 py-2">
+                        <div className="truncate">Time</div>
+                        <div className="text-right tabular-nums">O</div>
+                        <div className="text-right tabular-nums">C</div>
+                        <div className="text-right tabular-nums">Vol</div>
                       </div>
+
+                      {/* Rows */}
                       <div className="max-h-56 overflow-auto">
                         {recentRows.map((r, idx) => (
-                          <div key={idx} className="grid grid-cols-5 px-3 py-2 text-xs border-t border-zinc-900/60">
-                            <div className="col-span-2 text-zinc-400 truncate">{r.time}</div>
-                            <div className="text-right text-zinc-300">${fmtMoney(r.open)}</div>
-                            <div className={`text-right font-medium ${r.up ? "text-emerald-200" : "text-red-200"}`}>
+                          <div
+                            key={idx}
+                            className="grid grid-cols-[minmax(0,1fr)_120px_120px_84px] px-3 py-2 text-xs border-t border-zinc-900/60 items-center"
+                          >
+                            <div className="text-zinc-400 truncate">{r.time}</div>
+                            <div className="text-right text-zinc-300 tabular-nums whitespace-nowrap">${fmtMoney(r.open)}</div>
+                            <div
+                              className={`text-right font-medium tabular-nums whitespace-nowrap ${
+                                r.up ? "text-emerald-200" : "text-red-200"
+                              }`}
+                            >
                               ${fmtMoney(r.close)}
                             </div>
-                            <div className="text-right text-zinc-500">{Math.round(r.volume).toLocaleString()}</div>
+                            <div className="text-right text-zinc-500 tabular-nums whitespace-nowrap">
+                              {fmtVol(r.volume)}
+                            </div>
                           </div>
                         ))}
                       </div>
