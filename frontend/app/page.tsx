@@ -417,9 +417,10 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
   }
 
   useEffect(() => {
-    const t = hist?.candles?.[hist.candles.length - 1]?.time;
-    setLastUpdated(t ?? null);
-  }, [hist]);
+  const candles = hist?.candles ?? [];
+  const t = candles.length ? candles[candles.length - 1].time : null;
+  setLastUpdated(t);
+}, [hist]);
 
   useEffect(() => {
     setSymbolQuery(symbol);
