@@ -195,7 +195,7 @@ export default function Home() {
     null
   );
 
-  const [symbolQuery, setSymbolQuery] = useState(" ");
+  const [symbolQuery, setSymbolQuery] = useState("AAPL");
   const [comboOpen, setComboOpen] = useState(false);
 
   const candles = useMemo(() => hist?.candles ?? [], [hist]);
