@@ -133,11 +133,57 @@ function Skeleton({ className = "" }: { className?: string }) {
   );
 }
 
+
 function fmtMoney(n: number) {
   return n.toLocaleString(undefined, {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+}
+
+function SegmentedToggle({
+  value,
+  onChange,
+  leftLabel,
+  rightLabel,
+  leftValue,
+  rightValue,
+}: {
+  value: string;
+  onChange: (v: any) => void;
+  leftLabel: string;
+  rightLabel: string;
+  leftValue: string;
+  rightValue: string;
+}) {
+  return (
+    <div className="inline-flex rounded-lg border border-zinc-800 bg-zinc-950 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => onChange(leftValue)}
+        className={`px-2 py-1 text-xs font-medium transition ${
+          value === leftValue
+            ? "bg-zinc-100 text-zinc-900"
+            : "text-zinc-300 hover:bg-zinc-900/50"
+        }`}
+        aria-pressed={value === leftValue}
+      >
+        {leftLabel}
+      </button>
+      <button
+        type="button"
+        onClick={() => onChange(rightValue)}
+        className={`px-2 py-1 text-xs font-medium transition ${
+          value === rightValue
+            ? "bg-zinc-100 text-zinc-900"
+            : "text-zinc-300 hover:bg-zinc-900/50"
+        }`}
+        aria-pressed={value === rightValue}
+      >
+        {rightLabel}
+      </button>
+    </div>
+  );
 }
 
 
@@ -159,6 +205,8 @@ export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
   const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
   const [assetType, setAssetType] = useState<AssetType>("stock");
+  const [lastStockSymbol, setLastStockSymbol] = useState("AAPL");
+  const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState<string | null>(null);
   const [pred, setPred] = useState<PredictResponse | null>(null);
@@ -301,6 +349,14 @@ export default function Home() {
     if (s.includes("-")) return s;
     return `${s}-USD`;
   }
+
+  useEffect(() => {
+    if (assetType === "crypto") {
+      setLastCryptoPair(normalizeCryptoPair(symbol));
+    } else {
+      setLastStockSymbol(((symbol || "").trim().toUpperCase() || "AAPL"));
+    }
+  }, [symbol, assetType]);
 
   function displaySymbol() {
     return (pred?.symbol ?? pred?.pair ?? symbol).toString().toUpperCase();
@@ -733,9 +789,34 @@ export default function Home() {
                 ? "online"
                 : "offline"}
             </span>
-            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Asset: {assetType === "crypto" ? "crypto" : "stock"}
-            </span>
+            <div className="flex items-center gap-2 px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              <span className="text-zinc-400">Asset:</span>
+              <SegmentedToggle
+                value={assetType}
+                leftLabel="Stocks"
+                rightLabel="Crypto"
+                leftValue="stock"
+                rightValue="crypto"
+                onChange={(next: "stock" | "crypto") => {
+                  if (next === assetType) return;
+
+                  if (next === "stock") {
+                    setAssetType("stock");
+                    const pick = (lastStockSymbol || "AAPL").trim().toUpperCase();
+                    setSymbol(pick);
+                    setSymbolQuery(pick);
+                    setNewsTab("market");
+                  } else {
+                    setAssetType("crypto");
+                    const pick = normalizeCryptoPair(lastCryptoPair || "BTC-USD");
+                    setSymbol(pick);
+                    setSymbolQuery(pick);
+                    setNewsTab("market");
+                    setBt(null);
+                  }
+                }}
+              />
+            </div>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Data: {pred?.source ?? "—"}
             </span>
@@ -799,52 +880,6 @@ export default function Home() {
           <div className="md:col-span-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-3 w-full">
-                {/* Asset Type toggle */}
-                <div className="flex rounded-xl border border-zinc-800 bg-zinc-950 overflow-hidden">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAssetType("stock");
-                      const next = symbol.trim().toUpperCase();
-                      const pick = next || "AAPL";
-                      setSymbol(pick);
-                      setSymbolQuery(pick);
-                      setNewsTab("market");
-                    }}
-                    className={`px-3 py-3 text-xs font-medium transition ${
-                      assetType === "stock"
-                        ? "bg-zinc-100 text-zinc-900"
-                        : "text-zinc-300 hover:bg-zinc-900/50"
-                    }`}
-                    aria-pressed={assetType === "stock"}
-                  >
-                    Stocks
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAssetType("crypto");
-                      const next = symbol.trim().toUpperCase();
-                      const pick =
-                        next && next.includes("-")
-                          ? next
-                          : normalizeCryptoPair(next || "BTC");
-                      setSymbol(pick);
-                      setSymbolQuery(pick);
-                      setNewsTab("market");
-                      setBt(null);
-                    }}
-                    className={`px-3 py-3 text-xs font-medium transition ${
-                      assetType === "crypto"
-                        ? "bg-zinc-100 text-zinc-900"
-                        : "text-zinc-300 hover:bg-zinc-900/50"
-                    }`}
-                    aria-pressed={assetType === "crypto"}
-                  >
-                    Crypto
-                  </button>
-                </div>
-
                 <div className="relative flex-1">
                   <input
                     className="w-full rounded-xl bg-zinc-950 border border-zinc-800 px-4 py-3 outline-none focus:ring-2 focus:ring-zinc-600"
