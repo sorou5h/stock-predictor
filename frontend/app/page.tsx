@@ -534,6 +534,10 @@ export default function Home() {
 
     setLoading(true);
     setError(null);
+    // Clear previous results so we don't render stale objects while loading
+    setPred(null);
+    setHist(null);
+    setForecast(null);
 
     const startedAt = Date.now();
 
@@ -1297,13 +1301,13 @@ export default function Home() {
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Last close</div>
                     <div className="text-lg font-semibold">
-                      ${pred.last_close.toFixed(2)}
+                      ${fmtMoney(safeNum(pred.last_close))}
                     </div>
                   </div>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Predicted next</div>
                     <div className="text-lg font-semibold">
-                      ${pred.prediction.toFixed(2)}
+                      ${fmtMoney(safeNum(pred.prediction))}
                     </div>
                   </div>
                 </div>
@@ -1341,16 +1345,21 @@ export default function Home() {
                                 {fmtMoney(it.range_high)})
                               </span>
                             </div>
-                            <span
-                              className={
-                                it.change_pct >= 0
-                                  ? "text-xs text-emerald-200"
-                                  : "text-xs text-red-200"
-                              }
-                            >
-                              {it.change_pct >= 0 ? "+" : ""}
-                              {it.change_pct.toFixed(2)}%
-                            </span>
+                            {(() => {
+                              const cp = safeNum((it as any)?.change_pct, 0);
+                              return (
+                                <span
+                                  className={
+                                    cp >= 0
+                                      ? "text-xs text-emerald-200"
+                                      : "text-xs text-red-200"
+                                  }
+                                >
+                                  {cp >= 0 ? "+" : ""}
+                                  {cp.toFixed(2)}%
+                                </span>
+                              );
+                            })()}
                           </div>
                         );
                       })}
@@ -1361,7 +1370,7 @@ export default function Home() {
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="text-xs text-zinc-500">Expected range</div>
                   <div className="text-base font-semibold">
-                    ${pred.range_low.toFixed(2)} — ${pred.range_high.toFixed(2)}
+                    ${fmtMoney(safeNum(pred.range_low))} — ${fmtMoney(safeNum(pred.range_high))}
                   </div>
                   <div className="mt-1 text-xs text-zinc-500">
                     Confidence: {(pred.confidence * 100).toFixed(0)}%
