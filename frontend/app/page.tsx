@@ -806,7 +806,7 @@ export default function Home() {
                     onClick={() => {
                       setAssetType("stock");
                       const next = symbol.trim().toUpperCase();
-                      const pick = next || " ";
+                      const pick = next || "AAPL";
                       setSymbol(pick);
                       setSymbolQuery(pick);
                       setNewsTab("market");
