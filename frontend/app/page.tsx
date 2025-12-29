@@ -1491,36 +1491,49 @@ export default function Home() {
                   {recentRows.length === 0 ? (
                     <div className="mt-3 text-sm text-zinc-500">No candle history yet.</div>
                   ) : (
-                    <div className="mt-3 overflow-hidden rounded-lg border border-zinc-800">
-                      {/* Header */}
-                      <div className="grid grid-cols-[minmax(0,1fr)_120px_120px_84px] bg-zinc-900/30 text-[11px] text-zinc-500 px-3 py-2">
-                        <div className="truncate">Time</div>
-                        <div className="text-right tabular-nums">O</div>
-                        <div className="text-right tabular-nums">C</div>
-                        <div className="text-right tabular-nums">Vol</div>
-                      </div>
-
-                      {/* Rows */}
-                      <div className="max-h-56 overflow-auto">
-                        {recentRows.map((r, idx) => (
-                          <div
-                            key={idx}
-                            className="grid grid-cols-[minmax(0,1fr)_120px_120px_84px] px-3 py-2 text-xs border-t border-zinc-900/60 items-center"
-                          >
-                            <div className="text-zinc-400 truncate">{r.time}</div>
-                            <div className="text-right text-zinc-300 tabular-nums whitespace-nowrap">${fmtMoney(r.open)}</div>
-                            <div
-                              className={`text-right font-medium tabular-nums whitespace-nowrap ${
-                                r.up ? "text-emerald-200" : "text-red-200"
-                              }`}
-                            >
-                              ${fmtMoney(r.close)}
-                            </div>
-                            <div className="text-right text-zinc-500 tabular-nums whitespace-nowrap">
-                              {fmtVol(r.volume)}
-                            </div>
-                          </div>
-                        ))}
+                    <div className="mt-3 rounded-lg border border-zinc-800 overflow-hidden">
+                      <div className="max-h-64 overflow-auto">
+                        <table className="w-full table-fixed">
+                          <colgroup>
+                            <col style={{ width: "40%" }} />
+                            <col style={{ width: "22%" }} />
+                            <col style={{ width: "22%" }} />
+                            <col style={{ width: "16%" }} />
+                          </colgroup>
+                          <thead className="sticky top-0 z-10 bg-zinc-900/60 backdrop-blur">
+                            <tr className="text-[11px] text-zinc-500">
+                              <th className="text-left font-medium px-3 py-2">Time</th>
+                              <th className="text-right font-medium px-3 py-2 tabular-nums">Open</th>
+                              <th className="text-right font-medium px-3 py-2 tabular-nums">Close</th>
+                              <th className="text-right font-medium px-3 py-2 tabular-nums">Vol</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {recentRows.map((r, idx) => (
+                              <tr
+                                key={idx}
+                                className="border-t border-zinc-900/60 text-xs align-middle"
+                              >
+                                <td className="px-3 py-2 text-zinc-400 whitespace-nowrap truncate">
+                                  {r.time}
+                                </td>
+                                <td className="px-3 py-2 text-right text-zinc-300 tabular-nums whitespace-nowrap">
+                                  ${fmtMoney(r.open)}
+                                </td>
+                                <td
+                                  className={`px-3 py-2 text-right font-medium tabular-nums whitespace-nowrap ${
+                                    r.up ? "text-emerald-200" : "text-red-200"
+                                  }`}
+                                >
+                                  ${fmtMoney(r.close)}
+                                </td>
+                                <td className="px-3 py-2 text-right text-zinc-500 tabular-nums whitespace-nowrap">
+                                  {fmtVol(r.volume)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
                       </div>
                     </div>
                   )}
