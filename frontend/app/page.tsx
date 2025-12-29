@@ -8,7 +8,8 @@ import CandleChart from "../components/CandleChart";
  * - Local dev fallback: http://localhost:8001
  * - Vercel prod: set NEXT_PUBLIC_API_BASE_URL to your Render backend URL
  */
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8001";
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8001";
 
 type AssetType = "stock" | "crypto";
 
@@ -125,7 +126,10 @@ type BacktestResponse = {
 
 function Skeleton({ className = "" }: { className?: string }) {
   return (
-    <div className={`animate-pulse rounded-lg bg-zinc-800/60 ${className}`} aria-hidden="true" />
+    <div
+      className={`animate-pulse rounded-lg bg-zinc-800/60 ${className}`}
+      aria-hidden="true"
+    />
   );
 }
 
@@ -135,6 +139,7 @@ function fmtMoney(n: number) {
     maximumFractionDigits: 2,
   });
 }
+
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
@@ -150,55 +155,12 @@ function safeNum(x: any, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-// --- Simple indicators (client-side, from fetched candles) ---
-function sma(values: number[], period: number) {
-  if (values.length < period) return null;
-  let s = 0;
-  for (let i = values.length - period; i < values.length; i++) s += values[i];
-  return s / period;
-}
-
-function rsi(closes: number[], period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0;
-  let losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses += -diff;
-  }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
-}
-
-function atr(highs: number[], lows: number[], closes: number[], period = 14) {
-  const n = closes.length;
-  if (n < period + 1) return null;
-  const trs: number[] = [];
-  for (let i = 1; i < n; i++) {
-    const h = highs[i];
-    const l = lows[i];
-    const pc = closes[i - 1];
-    const tr = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
-    trs.push(tr);
-  }
-  if (trs.length < period) return null;
-  let sum = 0;
-  for (let i = trs.length - period; i < trs.length; i++) sum += trs[i];
-  return sum / period;
-}
-
 export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
   const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
   const [assetType, setAssetType] = useState<AssetType>("stock");
-
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState<string | null>(null);
-
   const [pred, setPred] = useState<PredictResponse | null>(null);
   const [hist, setHist] = useState<HistoryResponse | null>(null);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
@@ -213,7 +175,6 @@ export default function Home() {
   const [liveChangePct, setLiveChangePct] = useState<number | null>(null);
   const [liveUpdatedAt, setLiveUpdatedAt] = useState<string | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
-
   const [error, setError] = useState<string | null>(null);
 
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
@@ -230,15 +191,14 @@ export default function Home() {
 
   const [cryptoSymbols, setCryptoSymbols] = useState<CryptoSymbolItem[]>([]);
   const [cryptoSymbolsLoading, setCryptoSymbolsLoading] = useState(false);
-  const [cryptoSymbolsError, setCryptoSymbolsError] = useState<string | null>(null);
+  const [cryptoSymbolsError, setCryptoSymbolsError] = useState<string | null>(
+    null
+  );
 
   const [symbolQuery, setSymbolQuery] = useState("AAPL");
   const [comboOpen, setComboOpen] = useState(false);
 
   const candles = useMemo(() => hist?.candles ?? [], [hist]);
-
-  const [lastStockSymbol, setLastStockSymbol] = useState("AAPL");
-const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
 
   const insights = useMemo(() => {
     const cs = candles ?? [];
@@ -257,25 +217,20 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
       };
     }
 
-    useEffect(() => {
-  if (assetType === "crypto") {
-    const p = normalizeCryptoPair(symbol);
-    setLastCryptoPair(p);
-  } else {
-    const s = (symbol || "").trim().toUpperCase() || "AAPL";
-    setLastStockSymbol(s);
-  }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [symbol, assetType]);
     const last = cs[cs.length - 1];
     const lastClose = safeNum(last.close);
 
+    // Trend: compare last close vs close N candles ago
     const N = Math.min(20, cs.length - 1);
     const prevClose = safeNum(cs[cs.length - 1 - N].close, lastClose);
     const trendPct = pct(lastClose, prevClose);
 
     const trendTone =
-      trendPct > 0.25 ? ("good" as const) : trendPct < -0.25 ? ("bad" as const) : ("neutral" as const);
+      trendPct > 0.25
+        ? ("good" as const)
+        : trendPct < -0.25
+        ? ("bad" as const)
+        : ("neutral" as const);
 
     const trendLabel =
       trendPct > 0.25
@@ -284,29 +239,38 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
         ? `Down (${trendPct.toFixed(2)}%)`
         : `Flat (${trendPct.toFixed(2)}%)`;
 
+    // Volatility: avg absolute % move over last N candles
     const slice = cs.slice(-N - 1);
     let sumAbs = 0;
     let count = 0;
     for (let i = 1; i < slice.length; i++) {
       const c = safeNum(slice[i].close);
-      const p0 = safeNum(slice[i - 1].close);
-      if (p0) {
-        sumAbs += Math.abs(((c - p0) / p0) * 100);
+      const p = safeNum(slice[i - 1].close);
+      if (p) {
+        sumAbs += Math.abs(((c - p) / p) * 100);
         count += 1;
       }
     }
     const volPct = count ? sumAbs / count : 0;
 
+    // High/Low over last 52 candles (or available)
     const lookback = Math.min(52, cs.length);
     const lb = cs.slice(-lookback);
     const hi = Math.max(...lb.map((x) => safeNum(x.high)));
     const lo = Math.min(...lb.map((x) => safeNum(x.low)));
 
+    // Volume now vs avg
     const volNow = safeNum(last.volume, 0);
-    const volAvg = lb.reduce((acc, x) => acc + safeNum(x.volume, 0), 0) / Math.max(1, lb.length);
+    const volAvg =
+      lb.reduce((acc, x) => acc + safeNum(x.volume, 0), 0) /
+      Math.max(1, lb.length);
 
     const volTone =
-      volNow > volAvg * 1.15 ? ("good" as const) : volNow < volAvg * 0.85 ? ("bad" as const) : ("neutral" as const);
+      volNow > volAvg * 1.15
+        ? ("good" as const)
+        : volNow < volAvg * 0.85
+        ? ("bad" as const)
+        : ("neutral" as const);
 
     return {
       ok: true,
@@ -319,48 +283,6 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
       volAvg,
       volTone,
       lookback,
-    };
-  }, [candles]);
-
-  // NEW: “Under the chart” signal panel
-  const signal = useMemo(() => {
-    const cs = candles ?? [];
-    if (cs.length < 25) {
-      return {
-        ok: false,
-        sma20: null as number | null,
-        sma50: null as number | null,
-        rsi14: null as number | null,
-        atr14: null as number | null,
-        sup20: null as number | null,
-        res20: null as number | null,
-        ret5: null as number | null,
-        ret20: null as number | null,
-      };
-    }
-
-    const closes = cs.map((c) => safeNum(c.close));
-    const highs = cs.map((c) => safeNum(c.high));
-    const lows = cs.map((c) => safeNum(c.low));
-
-    const last = closes[closes.length - 1];
-    const c5 = closes.length >= 6 ? closes[closes.length - 1 - 5] : last;
-    const c20 = closes.length >= 21 ? closes[closes.length - 1 - 20] : c5;
-
-    const lb20 = cs.slice(-20);
-    const sup20 = Math.min(...lb20.map((x) => safeNum(x.low)));
-    const res20 = Math.max(...lb20.map((x) => safeNum(x.high)));
-
-    return {
-      ok: true,
-      sma20: sma(closes, 20),
-      sma50: sma(closes, 50),
-      rsi14: rsi(closes, 14),
-      atr14: atr(highs, lows, closes, 14),
-      sup20,
-      res20,
-      ret5: pct(last, c5),
-      ret20: pct(last, c20),
     };
   }, [candles]);
 
@@ -393,13 +315,19 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
   }
 
   function historyUrl(sym: string, tf: string, pts: number) {
-    const base = isCrypto() ? `/crypto/history/${encodeURIComponent(sym)}` : `/history/${encodeURIComponent(sym)}`;
+    const base = isCrypto()
+      ? `/crypto/history/${encodeURIComponent(sym)}`
+      : `/history/${encodeURIComponent(sym)}`;
     return apiPath(`${base}?timeframe=${tf}&points=${pts}`);
   }
 
   function backtestUrl(sym: string, tf: string, force: boolean) {
     if (isCrypto()) return null;
-    return apiPath(`/backtest/${encodeURIComponent(sym)}?timeframe=${tf}&force=${force ? "true" : "false"}`);
+    return apiPath(
+      `/backtest/${encodeURIComponent(sym)}?timeframe=${tf}&force=${
+        force ? "true" : "false"
+      }`
+    );
   }
 
   function symbolsUrl() {
@@ -413,14 +341,15 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
   function newsUrl(tab: "market" | "ticker", sym: string) {
     const s = sym.trim().toUpperCase();
     if (tab === "market") return apiPath("/news?mode=market&limit=6");
-    return apiPath(`/news?mode=ticker&symbol=${encodeURIComponent(s)}&limit=6`);
+    return apiPath(
+      `/news?mode=ticker&symbol=${encodeURIComponent(s)}&limit=6`
+    );
   }
 
   useEffect(() => {
-  const candles = hist?.candles ?? [];
-  const t = candles.length ? candles[candles.length - 1].time : null;
-  setLastUpdated(t);
-}, [hist]);
+    const t = hist?.candles?.[hist.candles.length - 1]?.time;
+    setLastUpdated(t ?? null);
+  }, [hist]);
 
   useEffect(() => {
     setSymbolQuery(symbol);
@@ -430,7 +359,8 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
     const s = sym.trim().toUpperCase();
     if (!s) return;
 
-    const actualTab: "market" | "ticker" = assetType === "crypto" && tab === "ticker" ? "market" : tab;
+    const actualTab: "market" | "ticker" =
+      assetType === "crypto" && tab === "ticker" ? "market" : tab;
 
     setNewsLoading(true);
     setNewsError(null);
@@ -439,6 +369,7 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
       const url = newsUrl(actualTab, s);
       const res = await fetch(url);
       if (!res.ok) throw new Error(`News API error: ${res.status}`);
+
       const json = (await res.json()) as NewsResponse;
       setNews(json);
     } catch (e: any) {
@@ -455,6 +386,7 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
       .then((r) => setBackendOk(r.ok))
       .catch(() => setBackendOk(false));
 
+    // Load S&P 500 symbols
     (async () => {
       setSymbolsLoading(true);
       setSymbolsError(null);
@@ -471,6 +403,7 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
       }
     })();
 
+    // Load crypto symbols
     (async () => {
       setCryptoSymbolsLoading(true);
       setCryptoSymbolsError(null);
@@ -518,13 +451,17 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
     return matches.slice(0, 25);
   }, [assetType, symbols, cryptoSymbols, symbolQuery]);
 
+  // When tab changes, reload news for the active tab
   useEffect(() => {
     loadNews(newsTab, symbol);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newsTab, assetType]);
 
+  // Also reload ticker news when the symbol changes (only if the ticker tab is active)
   useEffect(() => {
-    if (newsTab === "ticker") loadNews("ticker", symbol);
+    if (newsTab === "ticker") {
+      loadNews("ticker", symbol);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol]);
 
@@ -533,7 +470,10 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
     const s = isCrypto() ? normalizeCryptoPair(raw) : raw;
     if (!s) return;
 
+    // Refresh ticker immediately
     fetchLiveQuote(s);
+
+    // Auto-check accuracy (daily cached) - stocks only
     runBacktest(false, s);
 
     setLoading(true);
@@ -574,13 +514,17 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
         fetch(predictUrl(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(isCrypto() ? { pair: s, timeframe } : { symbol: s, timeframe }),
+          body: JSON.stringify(
+            isCrypto() ? { pair: s, timeframe } : { symbol: s, timeframe }
+          ),
         }),
         fetch(historyUrl(s, timeframe, 200)),
         fetch(forecastUrl(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(isCrypto() ? { pair: s, timeframe } : { symbol: s, timeframe }),
+          body: JSON.stringify(
+            isCrypto() ? { pair: s, timeframe } : { symbol: s, timeframe }
+          ),
         }),
       ]);
 
@@ -596,7 +540,10 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
       setHist(histJson);
       setForecast(fcJson);
     } catch (e: any) {
-      setError(e?.message ?? `Network error (is backend running on ${API_BASE}/health ?)`);
+      setError(
+        e?.message ??
+          `Network error (is backend running on ${API_BASE}/health ?)`
+      );
       setPred(null);
       setHist(null);
       setForecast(null);
@@ -604,7 +551,9 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
     } finally {
       const elapsed = Date.now() - startedAt;
       const minShowMs = 900;
-      if (elapsed < minShowMs) await new Promise((r) => setTimeout(r, minShowMs - elapsed));
+      if (elapsed < minShowMs) {
+        await new Promise((r) => setTimeout(r, minShowMs - elapsed));
+      }
 
       clearInterval(timer);
       setLoading(false);
@@ -614,9 +563,10 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
 
   async function runBacktest(force = false, symRaw?: string) {
     const raw = (symRaw ?? symbol).trim().toUpperCase();
-    const s = raw;
+    const s = raw; // backtest is stock-only
     if (!s) return;
 
+    // Crypto: skip backtest (optional)
     if (assetType === "crypto") {
       setBt(null);
       setBtError(null);
@@ -651,7 +601,9 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
 
     setLiveLoading(true);
     try {
-      const res = await fetch(historyUrl(s, timeframe, 2), { cache: "no-store" });
+      const res = await fetch(historyUrl(s, timeframe, 2), {
+        cache: "no-store",
+      });
       if (!res.ok) throw new Error(`Live price error: ${res.status}`);
 
       const j = (await res.json()) as HistoryResponse;
@@ -663,10 +615,10 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
 
       const lastClose = Number(last.close);
       const prevClose = prev ? Number(prev.close) : lastClose;
-      const p = prevClose ? ((lastClose - prevClose) / prevClose) * 100 : 0;
+      const pct = prevClose ? ((lastClose - prevClose) / prevClose) * 100 : 0;
 
       setLivePrice(lastClose);
-      setLiveChangePct(p);
+      setLiveChangePct(pct);
       setLiveUpdatedAt(new Date().toLocaleTimeString());
     } catch {
       setLivePrice(null);
@@ -677,6 +629,7 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
     }
   }
 
+  // Poll live price every 30s (updates when symbol/timeframe changes)
   useEffect(() => {
     fetchLiveQuote();
     const id = window.setInterval(() => fetchLiveQuote(), 30_000);
@@ -684,14 +637,17 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, timeframe, assetType]);
 
-  const changePct = pred ? ((pred.prediction - pred.last_close) / pred.last_close) * 100 : null;
+  const changePct =
+    pred ? ((pred.prediction - pred.last_close) / pred.last_close) * 100 : null;
 
   function badgeForPct(p: number) {
     const up = p >= 0;
     return (
       <span
         className={`px-2 py-1 rounded-lg text-xs border ${
-          up ? "border-emerald-700 bg-emerald-950/40 text-emerald-200" : "border-red-700 bg-red-950/40 text-red-200"
+          up
+            ? "border-emerald-700 bg-emerald-950/40 text-emerald-200"
+            : "border-red-700 bg-red-950/40 text-red-200"
         }`}
       >
         {up ? "+" : ""}
@@ -708,7 +664,11 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
         ? "border-red-700 bg-red-950/40 text-red-200"
         : "border-zinc-700 bg-zinc-950 text-zinc-200";
 
-    return <span className={`px-2 py-1 rounded-lg text-xs border ${cls}`}>{label}</span>;
+    return (
+      <span className={`px-2 py-1 rounded-lg text-xs border ${cls}`}>
+        {label}
+      </span>
+    );
   }
 
   function pctTone(p: number) {
@@ -724,7 +684,11 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
     return { label: "Low", tone: "bad" as const };
   }
 
-  function expectedMovePct(rangeLow: number, rangeHigh: number, lastClose: number) {
+  function expectedMovePct(
+    rangeLow: number,
+    rangeHigh: number,
+    lastClose: number
+  ) {
     const w = Math.max(0, rangeHigh - rangeLow);
     if (!lastClose || lastClose === 0) return 0;
     return (w / lastClose) * 100;
@@ -740,38 +704,34 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
     const spy = market?.SPY_ret_1 ?? 0;
     const qqq = market?.QQQ_ret_1 ?? 0;
     const avg = (spy + qqq) / 2;
-    if (avg > 0.15) return { label: "Risk-on", detail: "SPY/QQQ up", tone: "good" as const };
-    if (avg < -0.15) return { label: "Risk-off", detail: "SPY/QQQ down", tone: "bad" as const };
+    if (avg > 0.15)
+      return { label: "Risk-on", detail: "SPY/QQQ up", tone: "good" as const };
+    if (avg < -0.15)
+      return { label: "Risk-off", detail: "SPY/QQQ down", tone: "bad" as const };
     return { label: "Mixed", detail: "SPY/QQQ flat", tone: "neutral" as const };
   }
-
-  const recentRows = useMemo(() => {
-    const cs = candles ?? [];
-    const last = cs.slice(-10).reverse();
-    return last.map((c) => ({
-      time: c.time,
-      open: safeNum(c.open),
-      close: safeNum(c.close),
-      high: safeNum(c.high),
-      low: safeNum(c.low),
-      volume: safeNum(c.volume),
-      up: safeNum(c.close) >= safeNum(c.open),
-    }));
-  }, [candles]);
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="max-w-5xl mx-auto p-6">
         <header className="flex flex-col gap-2">
-          <h1 className="text-3xl font-semibold tracking-tight">Market Predictor</h1>
+          <h1 className="text-3xl font-semibold tracking-tight">
+            Market Predictor
+          </h1>
           <p className="text-sm text-zinc-400 max-w-2xl">
-            Forecasting demo using free market data + baseline ML. Stocks use market context (SPY/QQQ). Crypto runs without
-            SPY/QQQ context. Not financial advice.
+            Forecasting demo using free market data + baseline ML. Stocks use
+            market context (SPY/QQQ). Crypto runs without SPY/QQQ context. Not
+            financial advice.
           </p>
 
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Backend: {backendOk === null ? "checking…" : backendOk ? "online" : "offline"}
+              Backend:{" "}
+              {backendOk === null
+                ? "checking…"
+                : backendOk
+                ? "online"
+                : "offline"}
             </span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Asset: {assetType === "crypto" ? "crypto" : "stock"}
@@ -779,7 +739,9 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Data: {pred?.source ?? "—"}
             </span>
-            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">Mode: {timeframe}</span>
+            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
+              Mode: {timeframe}
+            </span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Updated: {lastUpdated ?? "—"}
             </span>
@@ -798,14 +760,24 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
               <span className="text-sm text-zinc-500">Loading price…</span>
             ) : livePrice !== null ? (
               <>
-                <span className="text-sm font-semibold">${fmtMoney(livePrice)}</span>
+                <span className="text-sm font-semibold">
+                  ${fmtMoney(livePrice)}
+                </span>
                 {liveChangePct !== null && (
-                  <span className={liveChangePct >= 0 ? "text-xs text-emerald-200" : "text-xs text-red-200"}>
+                  <span
+                    className={
+                      liveChangePct >= 0
+                        ? "text-xs text-emerald-200"
+                        : "text-xs text-red-200"
+                    }
+                  >
                     {liveChangePct >= 0 ? "+" : ""}
                     {liveChangePct.toFixed(2)}%
                   </span>
                 )}
-                <span className="text-xs text-zinc-500">Updated {liveUpdatedAt ?? "—"}</span>
+                <span className="text-xs text-zinc-500">
+                  Updated {liveUpdatedAt ?? "—"}
+                </span>
               </>
             ) : (
               <span className="text-sm text-zinc-500">Price unavailable</span>
@@ -827,23 +799,22 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
           <div className="md:col-span-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-3 w-full">
+                {/* Asset Type toggle */}
                 <div className="flex rounded-xl border border-zinc-800 bg-zinc-950 overflow-hidden">
                   <button
                     type="button"
                     onClick={() => {
-  // switch mode first
-  setAssetType("stock");
-
-  // restore last stock
-  const pick = (lastStockSymbol || "AAPL").trim().toUpperCase();
-  setSymbol(pick);
-  setSymbolQuery(pick);
-
-  // news tab rules
-  setNewsTab("market");
-}}
+                      setAssetType("stock");
+                      const next = symbol.trim().toUpperCase();
+                      const pick = next || "AAPL";
+                      setSymbol(pick);
+                      setSymbolQuery(pick);
+                      setNewsTab("market");
+                    }}
                     className={`px-3 py-3 text-xs font-medium transition ${
-                      assetType === "stock" ? "bg-zinc-100 text-zinc-900" : "text-zinc-300 hover:bg-zinc-900/50"
+                      assetType === "stock"
+                        ? "bg-zinc-100 text-zinc-900"
+                        : "text-zinc-300 hover:bg-zinc-900/50"
                     }`}
                     aria-pressed={assetType === "stock"}
                   >
@@ -852,18 +823,21 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                   <button
                     type="button"
                     onClick={() => {
-  setAssetType("crypto");
-
-  // restore last crypto
-  const pick = normalizeCryptoPair(lastCryptoPair || "BTC-USD");
-  setSymbol(pick);
-  setSymbolQuery(pick);
-
-  setNewsTab("market");
-  setBt(null);
-}}
+                      setAssetType("crypto");
+                      const next = symbol.trim().toUpperCase();
+                      const pick =
+                        next && next.includes("-")
+                          ? next
+                          : normalizeCryptoPair(next || "BTC");
+                      setSymbol(pick);
+                      setSymbolQuery(pick);
+                      setNewsTab("market");
+                      setBt(null);
+                    }}
                     className={`px-3 py-3 text-xs font-medium transition ${
-                      assetType === "crypto" ? "bg-zinc-100 text-zinc-900" : "text-zinc-300 hover:bg-zinc-900/50"
+                      assetType === "crypto"
+                        ? "bg-zinc-100 text-zinc-900"
+                        : "text-zinc-300 hover:bg-zinc-900/50"
                     }`}
                     aria-pressed={assetType === "crypto"}
                   >
@@ -901,23 +875,35 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                       <div className="max-h-72 overflow-auto">
                         {assetType === "crypto" ? (
                           cryptoSymbolsError ? (
-                            <div className="p-3 text-sm text-red-200">{cryptoSymbolsError}</div>
+                            <div className="p-3 text-sm text-red-200">
+                              {cryptoSymbolsError}
+                            </div>
                           ) : cryptoSymbolsLoading ? (
-                            <div className="p-3 text-sm text-zinc-400">Loading crypto…</div>
+                            <div className="p-3 text-sm text-zinc-400">
+                              Loading crypto…
+                            </div>
                           ) : filteredSymbols.length === 0 ? (
-                            <div className="p-3 text-sm text-zinc-500">No matches. You can still type BTC-USD, ETH-USD, etc.</div>
+                            <div className="p-3 text-sm text-zinc-500">
+                              No matches. You can still type BTC-USD, ETH-USD,
+                              etc.
+                            </div>
                           ) : (
                             filteredSymbols.map((it: any) => {
-                              const displaySym = String(it.pair ?? "").toUpperCase();
-                              const displayName = it.name ? String(it.name) : "Cryptocurrency";
+                              const displaySymbol = String(
+                                it.pair ?? ""
+                              ).toUpperCase();
+                              const displayName = it.name
+                                ? String(it.name)
+                                : "Cryptocurrency";
+
                               return (
                                 <button
-                                  key={displaySym}
+                                  key={displaySymbol}
                                   type="button"
                                   onMouseDown={(e) => e.preventDefault()}
                                   onClick={() => {
-                                    setSymbol(displaySym);
-                                    setSymbolQuery(displaySym);
+                                    setSymbol(displaySymbol);
+                                    setSymbolQuery(displaySymbol);
                                     setComboOpen(false);
                                   }}
                                   className="w-full text-left px-4 py-3 hover:bg-zinc-900/60 border-b border-zinc-900/50 last:border-b-0"
@@ -925,36 +911,50 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                                   <div className="flex items-center justify-between gap-3">
                                     <div className="min-w-0">
                                       <div className="text-sm font-semibold text-zinc-100 truncate">
-                                        {displaySym}
-                                        <span className="ml-2 text-xs font-normal text-zinc-400 truncate">{displayName}</span>
+                                        {displaySymbol}
+                                        <span className="ml-2 text-xs font-normal text-zinc-400 truncate">
+                                          {displayName}
+                                        </span>
                                       </div>
                                     </div>
-                                    <span className="text-xs text-zinc-400">Select</span>
+                                    <span className="text-xs text-zinc-400">
+                                      Select
+                                    </span>
                                   </div>
                                 </button>
                               );
                             })
                           )
                         ) : symbolsError ? (
-                          <div className="p-3 text-sm text-red-200">{symbolsError}</div>
+                          <div className="p-3 text-sm text-red-200">
+                            {symbolsError}
+                          </div>
                         ) : symbolsLoading ? (
-                          <div className="p-3 text-sm text-zinc-400">Loading symbols…</div>
+                          <div className="p-3 text-sm text-zinc-400">
+                            Loading symbols…
+                          </div>
                         ) : filteredSymbols.length === 0 ? (
-                          <div className="p-3 text-sm text-zinc-500">No matches. You can still type a ticker manually.</div>
+                          <div className="p-3 text-sm text-zinc-500">
+                            No matches. You can still type a ticker manually.
+                          </div>
                         ) : (
                           filteredSymbols.map((it: any) => {
-                            const displaySym = String((it.symbol_alt ?? it.symbol) ?? "").toUpperCase();
+                            const displaySymbol = String(
+                              (it.symbol_alt ?? it.symbol) ?? ""
+                            ).toUpperCase();
                             const displayName = String(it.name ?? "");
-                            const displayMeta = it.sector ? String(it.sector) : null;
+                            const displayMeta = it.sector
+                              ? String(it.sector)
+                              : null;
 
                             return (
                               <button
-                                key={displaySym}
+                                key={displaySymbol}
                                 type="button"
                                 onMouseDown={(e) => e.preventDefault()}
                                 onClick={() => {
-                                  setSymbol(displaySym);
-                                  setSymbolQuery(displaySym);
+                                  setSymbol(displaySymbol);
+                                  setSymbolQuery(displaySymbol);
                                   setComboOpen(false);
                                 }}
                                 className="w-full text-left px-4 py-3 hover:bg-zinc-900/60 border-b border-zinc-900/50 last:border-b-0"
@@ -962,12 +962,20 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                                 <div className="flex items-center justify-between gap-3">
                                   <div className="min-w-0">
                                     <div className="text-sm font-semibold text-zinc-100 truncate">
-                                      {displaySym}
-                                      <span className="ml-2 text-xs font-normal text-zinc-400 truncate">{displayName}</span>
+                                      {displaySymbol}
+                                      <span className="ml-2 text-xs font-normal text-zinc-400 truncate">
+                                        {displayName}
+                                      </span>
                                     </div>
-                                    {displayMeta ? <div className="mt-1 text-xs text-zinc-500 truncate">{displayMeta}</div> : null}
+                                    {displayMeta ? (
+                                      <div className="mt-1 text-xs text-zinc-500 truncate">
+                                        {displayMeta}
+                                      </div>
+                                    ) : null}
                                   </div>
-                                  <span className="text-xs text-zinc-400">Select</span>
+                                  <span className="text-xs text-zinc-400">
+                                    Select
+                                  </span>
                                 </div>
                               </button>
                             );
@@ -1011,12 +1019,19 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
               </div>
             </div>
 
-            {loading && <div className="mt-3 text-sm text-zinc-400">{loadingMsg ?? "Working…"}</div>}
-
-            {error && (
-              <div className="mt-4 rounded-xl border border-red-800 bg-red-950/40 p-4 text-sm text-red-200">{error}</div>
+            {loading && (
+              <div className="mt-3 text-sm text-zinc-400">
+                {loadingMsg ?? "Working…"}
+              </div>
             )}
 
+            {error && (
+              <div className="mt-4 rounded-xl border border-red-800 bg-red-950/40 p-4 text-sm text-red-200">
+                {error}
+              </div>
+            )}
+
+            {/* Key stats */}
             <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
               {loading ? (
                 <>
@@ -1042,11 +1057,15 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                 <>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Last close</div>
-                    <div className="mt-1 text-lg font-semibold">${fmtMoney(pred.last_close)}</div>
+                    <div className="mt-1 text-lg font-semibold">
+                      ${fmtMoney(pred.last_close)}
+                    </div>
                   </div>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Predicted next</div>
-                    <div className="mt-1 text-lg font-semibold">${fmtMoney(pred.prediction)}</div>
+                    <div className="mt-1 text-lg font-semibold">
+                      ${fmtMoney(pred.prediction)}
+                    </div>
                   </div>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Change</div>
@@ -1054,7 +1073,11 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                       {changePct === null ? (
                         "—"
                       ) : (
-                        <span className={changePct >= 0 ? "text-emerald-200" : "text-red-200"}>
+                        <span
+                          className={
+                            changePct >= 0 ? "text-emerald-200" : "text-red-200"
+                          }
+                        >
                           {changePct >= 0 ? "+" : ""}
                           {changePct.toFixed(2)}%
                         </span>
@@ -1064,9 +1087,14 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Confidence</div>
                     <div className="mt-2 h-2 w-full rounded-full bg-zinc-800">
-                      <div className="h-2 rounded-full bg-zinc-200" style={{ width: `${clamp01(pred.confidence) * 100}%` }} />
+                      <div
+                        className="h-2 rounded-full bg-zinc-200"
+                        style={{ width: `${clamp01(pred.confidence) * 100}%` }}
+                      />
                     </div>
-                    <div className="mt-2 text-xs text-zinc-400">{(pred.confidence * 100).toFixed(0)}%</div>
+                    <div className="mt-2 text-xs text-zinc-400">
+                      {(pred.confidence * 100).toFixed(0)}%
+                    </div>
                   </div>
                 </>
               ) : (
@@ -1076,31 +1104,45 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
               )}
             </div>
 
+            {/* Market context row */}
             {assetType === "stock" ? (
               <div className="mt-4 flex flex-wrap gap-2 text-xs text-zinc-300">
-                <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">Market context:</span>
+                <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                  Market context:
+                </span>
+
                 {pred?.market ? (
                   <>
-                    <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">SPY {badgeForPct(pred.market.SPY_ret_1)}</span>
-                    <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">QQQ {badgeForPct(pred.market.QQQ_ret_1)}</span>
+                    <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                      SPY {badgeForPct(pred.market.SPY_ret_1)}
+                    </span>
+                    <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950">
+                      QQQ {badgeForPct(pred.market.QQQ_ret_1)}
+                    </span>
                     {pred.cache?.ttl_sec ? (
                       <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-400">
-                        Cached: {pred.cache.hit ? "yes" : "no"} (TTL {pred.cache.ttl_sec}s)
+                        Cached: {pred.cache.hit ? "yes" : "no"} (TTL{" "}
+                        {pred.cache.ttl_sec}s)
                       </span>
                     ) : null}
                   </>
                 ) : (
-                  <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-500">run prediction to load</span>
+                  <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-500">
+                    run prediction to load
+                  </span>
                 )}
               </div>
             ) : (
-              <div className="mt-4 text-xs text-zinc-500">Crypto mode: no SPY/QQQ market context.</div>
+              <div className="mt-4 text-xs text-zinc-500">
+                Crypto mode: no SPY/QQQ market context.
+              </div>
             )}
 
             <div className="mt-4 h-[340px] min-w-0 w-full rounded-2xl border border-zinc-800 bg-zinc-950 p-3">
               {candles.length === 0 ? (
                 <div className="h-full flex items-center justify-center text-sm text-zinc-500">
-                  Run a prediction to load the candlestick chart (last 200 candles).
+                  Run a prediction to load the candlestick chart (last 200
+                  candles).
                 </div>
               ) : (
                 <CandleChart
@@ -1115,8 +1157,8 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
               )}
             </div>
 
-            {/* Under-chart content (fills the empty space) */}
             <div className="mt-3 space-y-3">
+              {/* Insights strip */}
               <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="text-[11px] text-zinc-500">Trend (last ~20)</div>
@@ -1141,17 +1183,31 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
 
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="text-[11px] text-zinc-500">Volatility (avg move)</div>
-                  <div className="mt-1 text-sm text-zinc-200">{insights.ok ? `~${insights.volPct.toFixed(2)}%` : "—"}</div>
+                  <div className="mt-1 text-sm text-zinc-200">
+                    {insights.ok ? `~${insights.volPct.toFixed(2)}%` : "—"}
+                  </div>
                 </div>
 
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
-                  <div className="text-[11px] text-zinc-500">High (last {insights.ok ? insights.lookback : "—"})</div>
-                  <div className="mt-1 text-sm text-zinc-200">{insights.ok && insights.hi !== null ? `$${fmtMoney(insights.hi)}` : "—"}</div>
+                  <div className="text-[11px] text-zinc-500">
+                    High (last {insights.ok ? insights.lookback : "—"})
+                  </div>
+                  <div className="mt-1 text-sm text-zinc-200">
+                    {insights.ok && insights.hi !== null
+                      ? `$${fmtMoney(insights.hi)}`
+                      : "—"}
+                  </div>
                 </div>
 
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
-                  <div className="text-[11px] text-zinc-500">Low (last {insights.ok ? insights.lookback : "—"})</div>
-                  <div className="mt-1 text-sm text-zinc-200">{insights.ok && insights.lo !== null ? `$${fmtMoney(insights.lo)}` : "—"}</div>
+                  <div className="text-[11px] text-zinc-500">
+                    Low (last {insights.ok ? insights.lookback : "—"})
+                  </div>
+                  <div className="mt-1 text-sm text-zinc-200">
+                    {insights.ok && insights.lo !== null
+                      ? `$${fmtMoney(insights.lo)}`
+                      : "—"}
+                  </div>
                 </div>
 
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
@@ -1167,7 +1223,9 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                             : "text-zinc-200"
                         }
                       >
-                        {insights.volAvg ? `${(insights.volNow / insights.volAvg).toFixed(2)}×` : "—"}
+                        {insights.volAvg
+                          ? `${(insights.volNow / insights.volAvg).toFixed(2)}×`
+                          : "—"}
                       </span>
                     ) : (
                       <span className="text-zinc-500">—</span>
@@ -1176,167 +1234,85 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                 </div>
               </div>
 
-              {/* NEW: Levels & Signals + Recent candles */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
-                  <div className="flex items-center justify-between">
-                    <div className="text-xs text-zinc-500">Levels & Signals</div>
-                    {signal.ok && signal.rsi14 !== null
-                      ? toneBadge(
-                          signal.rsi14 >= 70 ? "RSI overbought" : signal.rsi14 <= 30 ? "RSI oversold" : "RSI neutral",
-                          signal.rsi14 >= 70 ? "bad" : signal.rsi14 <= 30 ? "good" : "neutral"
-                        )
-                      : toneBadge("Waiting for data", "neutral")}
-                  </div>
-
-                  {!signal.ok ? (
-                    <div className="mt-3 text-sm text-zinc-500">Run a prediction to compute indicators.</div>
-                  ) : (
-                    <div className="mt-3 grid grid-cols-2 gap-2">
-                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">Support (20)</div>
-                        <div className="mt-1 text-sm font-semibold text-zinc-100">
-                          {signal.sup20 !== null ? `$${fmtMoney(signal.sup20)}` : "—"}
-                        </div>
-                      </div>
-                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">Resistance (20)</div>
-                        <div className="mt-1 text-sm font-semibold text-zinc-100">
-                          {signal.res20 !== null ? `$${fmtMoney(signal.res20)}` : "—"}
-                        </div>
-                      </div>
-
-                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">SMA 20 / 50</div>
-                        <div className="mt-1 text-sm text-zinc-200">
-                          {signal.sma20 !== null ? `$${fmtMoney(signal.sma20)}` : "—"}{" "}
-                          <span className="text-zinc-600">/</span>{" "}
-                          {signal.sma50 !== null ? `$${fmtMoney(signal.sma50)}` : "—"}
-                        </div>
-                      </div>
-                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">ATR (14)</div>
-                        <div className="mt-1 text-sm text-zinc-200">
-                          {signal.atr14 !== null ? `$${fmtMoney(signal.atr14)}` : "—"}
-                        </div>
-                      </div>
-
-                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">Return (5)</div>
-                        <div className={`mt-1 text-sm font-semibold ${((signal.ret5 ?? 0) >= 0) ? "text-emerald-200" : "text-red-200"}`}>
-                          {signal.ret5 === null ? "—" : `${signal.ret5 >= 0 ? "+" : ""}${signal.ret5.toFixed(2)}%`}
-                        </div>
-                      </div>
-                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">Return (20)</div>
-                        <div className={`mt-1 text-sm font-semibold ${((signal.ret20 ?? 0) >= 0) ? "text-emerald-200" : "text-red-200"}`}>
-                          {signal.ret20 === null ? "—" : `${signal.ret20 >= 0 ? "+" : ""}${signal.ret20.toFixed(2)}%`}
-                        </div>
-                      </div>
-
-                      {pred ? (
-                        <div className="col-span-2 rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                          <div className="text-[11px] text-zinc-500">Model expected range</div>
-                          <div className="mt-1 text-sm text-zinc-200">
-                            ${fmtMoney(pred.range_low)} – ${fmtMoney(pred.range_high)}{" "}
-                            <span className="text-zinc-500">
-                              (±{expectedMovePct(pred.range_low, pred.range_high, pred.last_close).toFixed(1)}%)
-                            </span>
-                          </div>
-                        </div>
-                      ) : null}
-                    </div>
-                  )}
-
-                  <p className="mt-3 text-[11px] text-zinc-600 leading-relaxed">
-                    These are simple technical indicators computed from the last 200 candles (not advice).
-                  </p>
-                </div>
-
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
-                  <div className="text-xs text-zinc-500">Recent candles (last 10)</div>
-                  {recentRows.length === 0 ? (
-                    <div className="mt-3 text-sm text-zinc-500">No candle history yet.</div>
-                  ) : (
-                    <div className="mt-3 overflow-hidden rounded-lg border border-zinc-800">
-                      <div className="grid grid-cols-5 bg-zinc-900/30 text-[11px] text-zinc-500 px-3 py-2">
-                        <div className="col-span-2">Time</div>
-                        <div className="text-right">O</div>
-                        <div className="text-right">C</div>
-                        <div className="text-right">Vol</div>
-                      </div>
-                      <div className="max-h-56 overflow-auto">
-                        {recentRows.map((r, idx) => (
-                          <div
-                            key={idx}
-                            className="grid grid-cols-5 px-3 py-2 text-xs border-t border-zinc-900/60"
-                          >
-                            <div className="col-span-2 text-zinc-400 truncate">{r.time}</div>
-                            <div className="text-right text-zinc-300">${fmtMoney(r.open)}</div>
-                            <div className={`text-right font-medium ${r.up ? "text-emerald-200" : "text-red-200"}`}>
-                              ${fmtMoney(r.close)}
-                            </div>
-                            <div className="text-right text-zinc-500">{Math.round(r.volume).toLocaleString()}</div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-
+              {/* Meta line */}
               <div className="text-xs text-zinc-500">
                 Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last {candles.length || 0} candles
               </div>
             </div>
           </div>
 
-          {/* RIGHT COLUMN (Forecast) – unchanged */}
           <div className="md:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <h2 className="text-sm font-medium text-zinc-300">Forecast</h2>
 
             {!pred ? (
-              <div className="mt-4 text-sm text-zinc-500">Run a prediction to see results.</div>
+              <div className="mt-4 text-sm text-zinc-500">
+                Run a prediction to see results.
+              </div>
             ) : (
               <div className="mt-4 space-y-4">
                 <div>
                   <div className="text-xs text-zinc-500">Symbol</div>
                   <div className="text-lg font-semibold">{displaySymbol()}</div>
-                  <div className="text-xs text-zinc-500 mt-1">Timeframe: {pred.timeframe}</div>
+                  <div className="text-xs text-zinc-500 mt-1">
+                    Timeframe: {pred.timeframe}
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Last close</div>
-                    <div className="text-lg font-semibold">${pred.last_close.toFixed(2)}</div>
+                    <div className="text-lg font-semibold">
+                      ${pred.last_close.toFixed(2)}
+                    </div>
                   </div>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Predicted next</div>
-                    <div className="text-lg font-semibold">${pred.prediction.toFixed(2)}</div>
+                    <div className="text-lg font-semibold">
+                      ${pred.prediction.toFixed(2)}
+                    </div>
                   </div>
                 </div>
 
+                {/* Multi-horizon forecast */}
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
-                  <div className="text-xs text-zinc-500">Multi-horizon forecast</div>
+                  <div className="text-xs text-zinc-500">
+                    Multi-horizon forecast
+                  </div>
                   {!forecast || forecast.horizons.length === 0 ? (
-                    <div className="mt-2 text-sm text-zinc-500">Forecast not available.</div>
+                    <div className="mt-2 text-sm text-zinc-500">
+                      Forecast not available.
+                    </div>
                   ) : (
                     <div className="mt-3 grid grid-cols-1 gap-2">
                       {forecast.horizons.map((it) => {
-                        const label = timeframe === "daily" ? `${it.horizon}D` : `${it.horizon}W`;
+                        const label =
+                          timeframe === "daily"
+                            ? `${it.horizon}D`
+                            : `${it.horizon}W`;
                         return (
                           <div
                             key={it.horizon}
                             className="flex items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-900/20 px-3 py-2"
                           >
                             <div className="flex items-center gap-2">
-                              <span className="text-xs text-zinc-400 w-10">{label}</span>
-                              <span className="text-sm font-semibold text-zinc-100">${fmtMoney(it.prediction)}</span>
+                              <span className="text-xs text-zinc-400 w-10">
+                                {label}
+                              </span>
+                              <span className="text-sm font-semibold text-zinc-100">
+                                ${fmtMoney(it.prediction)}
+                              </span>
                               <span className="text-xs text-zinc-500">
-                                (${fmtMoney(it.range_low)}–${fmtMoney(it.range_high)})
+                                (${fmtMoney(it.range_low)}–$
+                                {fmtMoney(it.range_high)})
                               </span>
                             </div>
-                            <span className={it.change_pct >= 0 ? "text-xs text-emerald-200" : "text-xs text-red-200"}>
+                            <span
+                              className={
+                                it.change_pct >= 0
+                                  ? "text-xs text-emerald-200"
+                                  : "text-xs text-red-200"
+                              }
+                            >
                               {it.change_pct >= 0 ? "+" : ""}
                               {it.change_pct.toFixed(2)}%
                             </span>
@@ -1363,9 +1339,12 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                   </div>
                 </div>
 
+                {/* Prediction Breakdown */}
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="flex items-center justify-between gap-3">
-                    <div className="text-xs text-zinc-500">Prediction Breakdown</div>
+                    <div className="text-xs text-zinc-500">
+                      Prediction Breakdown
+                    </div>
                     {(() => {
                       const c = confidenceLabel(pred.confidence);
                       return toneBadge(`${c.label} confidence`, c.tone);
@@ -1375,12 +1354,17 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                   <div className="mt-3 grid grid-cols-2 gap-2">
                     {(() => {
                       const dir = pred.prediction - pred.last_close;
-                      const p = (dir / pred.last_close) * 100;
-                      const tone = pctTone(p);
-                      const label = p >= 0 ? `Bullish (${p.toFixed(2)}%)` : `Bearish (${p.toFixed(2)}%)`;
+                      const pct = (dir / pred.last_close) * 100;
+                      const tone = pctTone(pct);
+                      const label =
+                        pct >= 0
+                          ? `Bullish (${pct.toFixed(2)}%)`
+                          : `Bearish (${pct.toFixed(2)}%)`;
                       return (
                         <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                          <div className="text-[11px] text-zinc-500">Direction</div>
+                          <div className="text-[11px] text-zinc-500">
+                            Direction
+                          </div>
                           <div className="mt-1">{toneBadge(label, tone)}</div>
                         </div>
                       );
@@ -1391,30 +1375,46 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                         const bias = marketBias(pred.market);
                         return (
                           <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                            <div className="text-[11px] text-zinc-500">Market mood</div>
+                            <div className="text-[11px] text-zinc-500">
+                              Market mood
+                            </div>
                             <div className="mt-1 flex flex-wrap items-center gap-2">
                               {toneBadge(bias.label, bias.tone)}
-                              <span className="text-[11px] text-zinc-500">{bias.detail}</span>
+                              <span className="text-[11px] text-zinc-500">
+                                {bias.detail}
+                              </span>
                             </div>
                           </div>
                         );
                       })()
                     ) : (
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">Market mood</div>
-                        <div className="mt-1 text-[11px] text-zinc-500">Crypto mode (no SPY/QQQ)</div>
+                        <div className="text-[11px] text-zinc-500">
+                          Market mood
+                        </div>
+                        <div className="mt-1 text-[11px] text-zinc-500">
+                          Crypto mode (no SPY/QQQ)
+                        </div>
                       </div>
                     )}
 
                     {(() => {
-                      const mv = expectedMovePct(pred.range_low, pred.range_high, pred.last_close);
+                      const mv = expectedMovePct(
+                        pred.range_low,
+                        pred.range_high,
+                        pred.last_close
+                      );
                       const r = riskLabelFromMove(mv);
                       return (
                         <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                          <div className="text-[11px] text-zinc-500">Expected move</div>
+                          <div className="text-[11px] text-zinc-500">
+                            Expected move
+                          </div>
                           <div className="mt-1 flex flex-wrap items-center gap-2">
                             {toneBadge(`~${mv.toFixed(1)}%`, r.tone)}
-                            <span className="text-[11px] text-zinc-500">Range-based</span>
+                            <span className="text-[11px] text-zinc-500">
+                              Range-based
+                            </span>
                           </div>
                         </div>
                       );
@@ -1423,12 +1423,20 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                     <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                       <div className="text-[11px] text-zinc-500">Key inputs</div>
                       <div className="mt-1 flex flex-wrap gap-2 text-xs">
-                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">Price history</span>
-                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">Volume</span>
+                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">
+                          Price history
+                        </span>
+                        <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">
+                          Volume
+                        </span>
                         {assetType === "stock" ? (
                           <>
-                            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">SPY</span>
-                            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">QQQ</span>
+                            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">
+                              SPY
+                            </span>
+                            <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-200">
+                              QQQ
+                            </span>
                           </>
                         ) : null}
                       </div>
@@ -1436,16 +1444,23 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                   </div>
 
                   <p className="mt-3 text-[11px] text-zinc-500 leading-relaxed">
-                    This breakdown is a simple explanation based on model inputs. It helps interpret the output, but it does not prove causation.
+                    This breakdown is a simple explanation based on model inputs.
+                    It helps interpret the output, but it does not prove
+                    causation.
                   </p>
                 </div>
 
+                {/* Accuracy / Backtest (stocks only) */}
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <div className="text-xs text-zinc-500">Accuracy (walk-forward backtest)</div>
+                      <div className="text-xs text-zinc-500">
+                        Accuracy (walk-forward backtest)
+                      </div>
                       <div className="mt-1 text-[11px] text-zinc-600">
-                        {assetType === "crypto" ? "Crypto backtest disabled." : "Auto cached daily • Use “Rerun now” for a fresh (slower) test"}
+                        {assetType === "crypto"
+                          ? "Crypto backtest disabled."
+                          : "Auto cached daily • Use “Rerun now” for a fresh (slower) test"}
                       </div>
                     </div>
                     <div className="flex gap-2">
@@ -1470,36 +1485,57 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                     </div>
                   </div>
 
-                  {btError ? <div className="mt-3 text-sm text-red-200">{btError}</div> : null}
+                  {btError ? (
+                    <div className="mt-3 text-sm text-red-200">{btError}</div>
+                  ) : null}
 
                   {assetType === "crypto" ? (
-                    <div className="mt-3 text-sm text-zinc-500">Backtest is currently stock-only.</div>
+                    <div className="mt-3 text-sm text-zinc-500">
+                      Backtest is currently stock-only.
+                    </div>
                   ) : !bt ? (
-                    <div className="mt-3 text-sm text-zinc-500">Run Predict (or Evaluate) to see historical accuracy.</div>
+                    <div className="mt-3 text-sm text-zinc-500">
+                      Run Predict (or Evaluate) to see historical accuracy.
+                    </div>
                   ) : bt.metrics?.ok ? (
                     <div className="mt-3 grid grid-cols-2 gap-2">
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
-                        <div className="text-[11px] text-zinc-500">Direction accuracy</div>
-                        <div className="mt-1 text-sm font-semibold">{((bt.metrics.direction_accuracy ?? 0) * 100).toFixed(1)}%</div>
+                        <div className="text-[11px] text-zinc-500">
+                          Direction accuracy
+                        </div>
+                        <div className="mt-1 text-sm font-semibold">
+                          {((bt.metrics.direction_accuracy ?? 0) * 100).toFixed(
+                            1
+                          )}
+                          %
+                        </div>
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                         <div className="text-[11px] text-zinc-500">MAPE</div>
-                        <div className="mt-1 text-sm font-semibold">{((bt.metrics.mape ?? 0) * 100).toFixed(2)}%</div>
+                        <div className="mt-1 text-sm font-semibold">
+                          {(((bt.metrics.mape ?? 0) * 100)).toFixed(2)}%
+                        </div>
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                         <div className="text-[11px] text-zinc-500">MAE</div>
-                        <div className="mt-1 text-sm font-semibold">${fmtMoney(bt.metrics.mae ?? 0)}</div>
+                        <div className="mt-1 text-sm font-semibold">
+                          ${fmtMoney(bt.metrics.mae ?? 0)}
+                        </div>
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                         <div className="text-[11px] text-zinc-500">Test points</div>
-                        <div className="mt-1 text-sm font-semibold">{bt.metrics.points ?? "—"}</div>
+                        <div className="mt-1 text-sm font-semibold">
+                          {bt.metrics.points ?? "—"}
+                        </div>
                       </div>
                       <div className="col-span-2 mt-1 text-[11px] text-zinc-500">
                         As of {bt.as_of} • Cache bucket {bt.day_bucket}
                       </div>
                     </div>
                   ) : (
-                    <div className="mt-3 text-sm text-zinc-500">Backtest unavailable: {bt.metrics?.reason ?? "unknown"}</div>
+                    <div className="mt-3 text-sm text-zinc-500">
+                      Backtest unavailable: {bt.metrics?.reason ?? "unknown"}
+                    </div>
                   )}
                 </div>
 
@@ -1510,11 +1546,17 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                 </div>
 
                 <details className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
-                  <summary className="cursor-pointer text-sm text-zinc-200 select-none">About this prediction</summary>
+                  <summary className="cursor-pointer text-sm text-zinc-200 select-none">
+                    About this prediction
+                  </summary>
                   <div className="mt-3 space-y-3 text-sm text-zinc-400">
                     <p>
-                      This is a demo model trained on historical candles using technical features (returns, moving averages, volatility, volume signals).
-                      {assetType === "stock" ? " Stocks also include market context from SPY and QQQ." : " Crypto runs without SPY/QQQ market context."}
+                      This is a demo model trained on historical candles using
+                      technical features (returns, moving averages, volatility,
+                      volume signals).
+                      {assetType === "stock"
+                        ? " Stocks also include market context from SPY and QQQ."
+                        : " Crypto runs without SPY/QQQ market context."}
                     </p>
                     <ul className="space-y-1">
                       <li>• Daily = next period close</li>
@@ -1529,12 +1571,14 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
           </div>
         </section>
 
-        {/* NEWS SECTION (still here) */}
+        {/* News */}
         <section className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <h2 className="text-sm font-medium text-zinc-200">Market News</h2>
-              <p className="text-xs text-zinc-500 mt-1">Latest headlines (US-only). Source: {news?.source ?? "—"}</p>
+              <p className="text-xs text-zinc-500 mt-1">
+                Latest headlines (US-only). Source: {news?.source ?? "—"}
+              </p>
             </div>
 
             <div className="flex gap-2">
@@ -1562,13 +1606,17 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                     : "border-zinc-800 bg-zinc-900/30 text-zinc-400 hover:text-zinc-200"
                 }`}
               >
-                {assetType === "crypto" ? "Ticker (disabled)" : displaySymbol() || "Ticker"}
+                {assetType === "crypto"
+                  ? "Ticker (disabled)"
+                  : displaySymbol() || "Ticker"}
               </button>
             </div>
           </div>
 
           {newsError && (
-            <div className="mt-4 rounded-xl border border-red-800 bg-red-950/40 p-4 text-sm text-red-200">{newsError}</div>
+            <div className="mt-4 rounded-xl border border-red-800 bg-red-950/40 p-4 text-sm text-red-200">
+              {newsError}
+            </div>
           )}
 
           <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1576,7 +1624,10 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
               {newsLoading ? (
                 <>
                   {[0, 1, 2].map((k) => (
-                    <div key={k} className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+                    <div
+                      key={k}
+                      className="rounded-xl border border-zinc-800 bg-zinc-950 p-4"
+                    >
                       <Skeleton className="h-4 w-40" />
                       <Skeleton className="mt-3 h-4 w-full" />
                       <Skeleton className="mt-2 h-4 w-5/6" />
@@ -1584,12 +1635,19 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                   ))}
                 </>
               ) : (news?.items?.length ?? 0) === 0 ? (
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm text-zinc-500">No news items.</div>
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-sm text-zinc-500">
+                  No news items.
+                </div>
               ) : (
                 news!.items.map((item) => (
-                  <article key={item.id} className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+                  <article
+                    key={item.id}
+                    className="rounded-xl border border-zinc-800 bg-zinc-950 p-4"
+                  >
                     <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-                      <span className="px-2 py-0.5 rounded-lg border border-zinc-800 bg-zinc-900/30">{item.source}</span>
+                      <span className="px-2 py-0.5 rounded-lg border border-zinc-800 bg-zinc-900/30">
+                        {item.source}
+                      </span>
                       {item.time ? (
                         <>
                           <span>•</span>
@@ -1600,7 +1658,12 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
 
                     <h3 className="mt-2 text-sm font-semibold text-zinc-100">
                       {item.url ? (
-                        <a href={item.url} target="_blank" rel="noreferrer" className="hover:underline">
+                        <a
+                          href={item.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="hover:underline"
+                        >
                           {item.title}
                         </a>
                       ) : (
@@ -1608,7 +1671,11 @@ const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
                       )}
                     </h3>
 
-                    {item.summary ? <p className="mt-2 text-sm text-zinc-400 leading-relaxed">{item.summary}</p> : null}
+                    {item.summary ? (
+                      <p className="mt-2 text-sm text-zinc-400 leading-relaxed">
+                        {item.summary}
+                      </p>
+                    ) : null}
                   </article>
                 ))
               )}
