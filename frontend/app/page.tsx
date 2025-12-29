@@ -201,6 +201,12 @@ function safeNum(x: any, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function safeToFixed(x: any, digits = 2, fallback = "—") {
+  if (x === null || x === undefined) return fallback;
+  const n = Number(x);
+  return Number.isFinite(n) ? n.toFixed(digits) : fallback;
+}
+
 export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
   const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
@@ -282,10 +288,10 @@ export default function Home() {
 
     const trendLabel =
       trendPct > 0.25
-        ? `Up (${trendPct.toFixed(2)}%)`
+        ? `Up (${safeToFixed(trendPct, 2)}%)`
         : trendPct < -0.25
-        ? `Down (${trendPct.toFixed(2)}%)`
-        : `Flat (${trendPct.toFixed(2)}%)`;
+        ? `Down (${safeToFixed(trendPct, 2)}%)`
+        : `Flat (${safeToFixed(trendPct, 2)}%)`;
 
     // Volatility: avg absolute % move over last N candles
     const slice = cs.slice(-N - 1);
@@ -711,7 +717,7 @@ export default function Home() {
         }`}
       >
         {up ? "+" : ""}
-        {p.toFixed(2)}%
+        {safeToFixed(p, 2, "0.00")}%
       </span>
     );
   }
@@ -857,7 +863,7 @@ export default function Home() {
                     }
                   >
                     {liveChangePct >= 0 ? "+" : ""}
-                    {liveChangePct.toFixed(2)}%
+                    {safeToFixed(liveChangePct, 2, "0.00")}%
                   </span>
                 )}
                 <span className="text-xs text-zinc-500">
@@ -1109,18 +1115,18 @@ export default function Home() {
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Change</div>
                     <div className="mt-1 text-lg font-semibold">
-                      {changePct === null ? (
-                        "—"
-                      ) : (
-                        <span
-                          className={
-                            changePct >= 0 ? "text-emerald-200" : "text-red-200"
-                          }
-                        >
-                          {changePct >= 0 ? "+" : ""}
-                          {changePct.toFixed(2)}%
-                        </span>
-                      )}
+                    {changePct === null ? (
+                      "—"
+                    ) : (
+                      <span
+                        className={
+                          changePct >= 0 ? "text-emerald-200" : "text-red-200"
+                        }
+                      >
+                        {changePct >= 0 ? "+" : ""}
+                        {safeToFixed(changePct, 2, "0.00")}%
+                      </span>
+                    )}
                     </div>
                   </div>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
@@ -1132,7 +1138,7 @@ export default function Home() {
                       />
                     </div>
                     <div className="mt-2 text-xs text-zinc-400">
-                      {(pred.confidence * 100).toFixed(0)}%
+                      {safeToFixed(pred.confidence * 100, 0, "0")}%
                     </div>
                   </div>
                 </>
@@ -1223,7 +1229,7 @@ export default function Home() {
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="text-[11px] text-zinc-500">Volatility (avg move)</div>
                   <div className="mt-1 text-sm text-zinc-200">
-                    {insights.ok ? `~${insights.volPct.toFixed(2)}%` : "—"}
+                    {insights.ok ? `~${safeToFixed(insights.volPct, 2, "0.00")}%` : "—"}
                   </div>
                 </div>
 
@@ -1263,7 +1269,7 @@ export default function Home() {
                         }
                       >
                         {insights.volAvg
-                          ? `${(insights.volNow / insights.volAvg).toFixed(2)}×`
+                          ? `${safeToFixed(insights.volNow / insights.volAvg, 2, "0.00")}×`
                           : "—"}
                       </span>
                     ) : (
@@ -1372,15 +1378,15 @@ export default function Home() {
                   <div className="text-base font-semibold">
                     ${fmtMoney(safeNum(pred.range_low))} — ${fmtMoney(safeNum(pred.range_high))}
                   </div>
-                  <div className="mt-1 text-xs text-zinc-500">
-                    Confidence: {(pred.confidence * 100).toFixed(0)}%
-                    {changePct !== null && (
-                      <span className="ml-2">
-                        • Change: {changePct >= 0 ? "+" : ""}
-                        {changePct.toFixed(2)}%
-                      </span>
-                    )}
-                  </div>
+                    <div className="mt-1 text-xs text-zinc-500">
+                      Confidence: {safeToFixed(pred.confidence * 100, 0, "0")}%
+                      {changePct !== null && (
+                        <span className="ml-2">
+                          • Change: {changePct >= 0 ? "+" : ""}
+                          {safeToFixed(changePct, 2, "0.00")}%
+                        </span>
+                      )}
+                    </div>
                 </div>
 
                 {/* Prediction Breakdown */}
@@ -1402,8 +1408,8 @@ export default function Home() {
                       const tone = pctTone(pct);
                       const label =
                         pct >= 0
-                          ? `Bullish (${pct.toFixed(2)}%)`
-                          : `Bearish (${pct.toFixed(2)}%)`;
+                          ? `Bullish (${safeToFixed(pct, 2, "0.00")}%)`
+                          : `Bearish (${safeToFixed(pct, 2, "0.00")}%)`;
                       return (
                         <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                           <div className="text-[11px] text-zinc-500">
@@ -1455,7 +1461,7 @@ export default function Home() {
                             Expected move
                           </div>
                           <div className="mt-1 flex flex-wrap items-center gap-2">
-                            {toneBadge(`~${mv.toFixed(1)}%`, r.tone)}
+                            {toneBadge(`~${safeToFixed(mv, 1, "0.0")}%`, r.tone)}
                             <span className="text-[11px] text-zinc-500">
                               Range-based
                             </span>
@@ -1548,16 +1554,14 @@ export default function Home() {
                           Direction accuracy
                         </div>
                         <div className="mt-1 text-sm font-semibold">
-                          {((bt.metrics.direction_accuracy ?? 0) * 100).toFixed(
-                            1
-                          )}
+                          {safeToFixed((bt.metrics.direction_accuracy ?? 0) * 100, 1, "0.0")}
                           %
                         </div>
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                         <div className="text-[11px] text-zinc-500">MAPE</div>
                         <div className="mt-1 text-sm font-semibold">
-                          {(((bt.metrics.mape ?? 0) * 100)).toFixed(2)}%
+                          {safeToFixed((bt.metrics.mape ?? 0) * 100, 2, "0.00")}%
                         </div>
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
