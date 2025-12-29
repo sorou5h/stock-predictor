@@ -207,6 +207,47 @@ function safeToFixed(x: any, digits = 2, fallback = "—") {
   return Number.isFinite(n) ? n.toFixed(digits) : fallback;
 }
 
+// --- Simple indicators (client-side, from fetched candles) ---
+function sma(values: number[], period: number) {
+  if (values.length < period) return null;
+  let s = 0;
+  for (let i = values.length - period; i < values.length; i++) s += values[i];
+  return s / period;
+}
+
+function rsi(closes: number[], period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses += -diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+function atr(highs: number[], lows: number[], closes: number[], period = 14) {
+  const n = closes.length;
+  if (n < period + 1) return null;
+  const trs: number[] = [];
+  for (let i = 1; i < n; i++) {
+    const h = highs[i];
+    const l = lows[i];
+    const pc = closes[i - 1];
+    const tr = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+    trs.push(tr);
+  }
+  if (trs.length < period) return null;
+  let sum = 0;
+  for (let i = trs.length - period; i < trs.length; i++) sum += trs[i];
+  return sum / period;
+}
+
 export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
   const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
@@ -339,6 +380,68 @@ export default function Home() {
       lookback,
     };
   }, [candles]);
+
+  // “Under the chart” signal panel (computed from fetched candles)
+  const signal = useMemo(() => {
+    const cs = candles ?? [];
+    if (cs.length < 25) {
+      return {
+        ok: false,
+        sma20: null as number | null,
+        sma50: null as number | null,
+        rsi14: null as number | null,
+        atr14: null as number | null,
+        sup20: null as number | null,
+        res20: null as number | null,
+        ret5: null as number | null,
+        ret20: null as number | null,
+      };
+    }
+
+    const closes = cs.map((c) => safeNum(c.close));
+    const highs = cs.map((c) => safeNum(c.high));
+    const lows = cs.map((c) => safeNum(c.low));
+
+    const last = closes[closes.length - 1];
+    const c5 = closes.length >= 6 ? closes[closes.length - 1 - 5] : last;
+    const c20 = closes.length >= 21 ? closes[closes.length - 1 - 20] : c5;
+
+    const lb20 = cs.slice(-20);
+    const sup20 = Math.min(...lb20.map((x) => safeNum(x.low)));
+    const res20 = Math.max(...lb20.map((x) => safeNum(x.high)));
+
+    return {
+      ok: true,
+      sma20: sma(closes, 20),
+      sma50: sma(closes, 50),
+      rsi14: rsi(closes, 14),
+      atr14: atr(highs, lows, closes, 14),
+      sup20,
+      res20,
+      ret5: pct(last, c5),
+      ret20: pct(last, c20),
+    };
+  }, [candles]);
+
+  const recentRows = useMemo(() => {
+    const cs = candles ?? [];
+    const last = cs.slice(-10).reverse();
+    return last.map((c) => ({
+      time: c.time,
+      open: safeNum(c.open),
+      close: safeNum(c.close),
+      high: safeNum(c.high),
+      low: safeNum(c.low),
+      volume: safeNum(c.volume),
+      up: safeNum(c.close) >= safeNum(c.open),
+    }));
+  }, [candles]);
+
+  function expectedMovePct(rangeLow: number, rangeHigh: number, lastClose: number) {
+    const w = Math.max(0, rangeHigh - rangeLow);
+    if (!lastClose || lastClose === 0) return 0;
+    return (w / lastClose) * 100;
+  }
 
   // -------- API helpers (stock/crypto routing) --------
   function apiPath(p: string) {
@@ -750,15 +853,7 @@ export default function Home() {
     return { label: "Low", tone: "bad" as const };
   }
 
-  function expectedMovePct(
-    rangeLow: number,
-    rangeHigh: number,
-    lastClose: number
-  ) {
-    const w = Math.max(0, rangeHigh - rangeLow);
-    if (!lastClose || lastClose === 0) return 0;
-    return (w / lastClose) * 100;
-  }
+  // (expectedMovePct is now defined above in the "under the chart" helpers)
 
   function riskLabelFromMove(movePct: number) {
     if (movePct >= 6) return { label: "High", tone: "bad" as const };
@@ -1279,6 +1374,138 @@ export default function Home() {
                 </div>
               </div>
 
+              {/* Levels & Signals + Recent candles */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs text-zinc-500">Levels & Signals</div>
+                    {signal.ok && signal.rsi14 !== null
+                      ? toneBadge(
+                          signal.rsi14 >= 70
+                            ? "RSI overbought"
+                            : signal.rsi14 <= 30
+                            ? "RSI oversold"
+                            : "RSI neutral",
+                          signal.rsi14 >= 70
+                            ? "bad"
+                            : signal.rsi14 <= 30
+                            ? "good"
+                            : "neutral"
+                        )
+                      : toneBadge("Waiting for data", "neutral")}
+                  </div>
+
+                  {!signal.ok ? (
+                    <div className="mt-3 text-sm text-zinc-500">Run a prediction to compute indicators.</div>
+                  ) : (
+                    <div className="mt-3 grid grid-cols-2 gap-2">
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">Support (20)</div>
+                        <div className="mt-1 text-sm font-semibold text-zinc-100">
+                          {signal.sup20 !== null ? `$${fmtMoney(signal.sup20)}` : "—"}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">Resistance (20)</div>
+                        <div className="mt-1 text-sm font-semibold text-zinc-100">
+                          {signal.res20 !== null ? `$${fmtMoney(signal.res20)}` : "—"}
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">SMA 20 / 50</div>
+                        <div className="mt-1 text-sm text-zinc-200">
+                          {signal.sma20 !== null ? `$${fmtMoney(signal.sma20)}` : "—"}{" "}
+                          <span className="text-zinc-600">/</span>{" "}
+                          {signal.sma50 !== null ? `$${fmtMoney(signal.sma50)}` : "—"}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">ATR (14)</div>
+                        <div className="mt-1 text-sm text-zinc-200">
+                          {signal.atr14 !== null ? `$${fmtMoney(signal.atr14)}` : "—"}
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">Return (5)</div>
+                        <div
+                          className={`mt-1 text-sm font-semibold ${(signal.ret5 ?? 0) >= 0 ? "text-emerald-200" : "text-red-200"}`}
+                        >
+                          {signal.ret5 === null
+                            ? "—"
+                            : `${signal.ret5 >= 0 ? "+" : ""}${safeToFixed(signal.ret5, 2, "0.00")}%`}
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                        <div className="text-[11px] text-zinc-500">Return (20)</div>
+                        <div
+                          className={`mt-1 text-sm font-semibold ${(signal.ret20 ?? 0) >= 0 ? "text-emerald-200" : "text-red-200"}`}
+                        >
+                          {signal.ret20 === null
+                            ? "—"
+                            : `${signal.ret20 >= 0 ? "+" : ""}${safeToFixed(signal.ret20, 2, "0.00")}%`}
+                        </div>
+                      </div>
+
+                      {pred ? (
+                        <div className="col-span-2 rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                          <div className="text-[11px] text-zinc-500">Model expected range</div>
+                          <div className="mt-1 text-sm text-zinc-200">
+                            ${fmtMoney(safeNum(pred.range_low))} – ${fmtMoney(safeNum(pred.range_high))}{" "}
+                            <span className="text-zinc-500">
+                              (±
+                              {safeToFixed(
+                                expectedMovePct(
+                                  safeNum(pred.range_low),
+                                  safeNum(pred.range_high),
+                                  safeNum(pred.last_close)
+                                ),
+                                1,
+                                "0.0"
+                              )}%
+                              )
+                            </span>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
+
+                  <p className="mt-3 text-[11px] text-zinc-600 leading-relaxed">
+                    These are simple technical indicators computed from the last 200 candles (not advice).
+                  </p>
+                </div>
+
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+                  <div className="text-xs text-zinc-500">Recent candles (last 10)</div>
+                  {recentRows.length === 0 ? (
+                    <div className="mt-3 text-sm text-zinc-500">No candle history yet.</div>
+                  ) : (
+                    <div className="mt-3 overflow-hidden rounded-lg border border-zinc-800">
+                      <div className="grid grid-cols-5 bg-zinc-900/30 text-[11px] text-zinc-500 px-3 py-2">
+                        <div className="col-span-2">Time</div>
+                        <div className="text-right">O</div>
+                        <div className="text-right">C</div>
+                        <div className="text-right">Vol</div>
+                      </div>
+                      <div className="max-h-56 overflow-auto">
+                        {recentRows.map((r, idx) => (
+                          <div key={idx} className="grid grid-cols-5 px-3 py-2 text-xs border-t border-zinc-900/60">
+                            <div className="col-span-2 text-zinc-400 truncate">{r.time}</div>
+                            <div className="text-right text-zinc-300">${fmtMoney(r.open)}</div>
+                            <div className={`text-right font-medium ${r.up ? "text-emerald-200" : "text-red-200"}`}>
+                              ${fmtMoney(r.close)}
+                            </div>
+                            <div className="text-right text-zinc-500">{Math.round(r.volume).toLocaleString()}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
               {/* Meta line */}
               <div className="text-xs text-zinc-500">
                 Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last {candles.length || 0} candles
@@ -1362,7 +1589,7 @@ export default function Home() {
                                   }
                                 >
                                   {cp >= 0 ? "+" : ""}
-                                  {cp.toFixed(2)}%
+                                  {safeToFixed(cp, 2, "0.00")}%
                                 </span>
                               );
                             })()}
