@@ -237,6 +237,9 @@ export default function Home() {
 
   const candles = useMemo(() => hist?.candles ?? [], [hist]);
 
+  const [lastStockSymbol, setLastStockSymbol] = useState("AAPL");
+const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
+
   const insights = useMemo(() => {
     const cs = candles ?? [];
     if (cs.length < 5) {
@@ -254,6 +257,16 @@ export default function Home() {
       };
     }
 
+    useEffect(() => {
+  if (assetType === "crypto") {
+    const p = normalizeCryptoPair(symbol);
+    setLastCryptoPair(p);
+  } else {
+    const s = (symbol || "").trim().toUpperCase() || "AAPL";
+    setLastStockSymbol(s);
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [symbol, assetType]);
     const last = cs[cs.length - 1];
     const lastClose = safeNum(last.close);
 
@@ -817,13 +830,17 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={() => {
-                      setAssetType("stock");
-                      const next = symbol.trim().toUpperCase();
-                      const pick = next || "AAPL";
-                      setSymbol(pick);
-                      setSymbolQuery(pick);
-                      setNewsTab("market");
-                    }}
+  // switch mode first
+  setAssetType("stock");
+
+  // restore last stock
+  const pick = (lastStockSymbol || "AAPL").trim().toUpperCase();
+  setSymbol(pick);
+  setSymbolQuery(pick);
+
+  // news tab rules
+  setNewsTab("market");
+}}
                     className={`px-3 py-3 text-xs font-medium transition ${
                       assetType === "stock" ? "bg-zinc-100 text-zinc-900" : "text-zinc-300 hover:bg-zinc-900/50"
                     }`}
@@ -834,14 +851,16 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={() => {
-                      setAssetType("crypto");
-                      const next = symbol.trim().toUpperCase();
-                      const pick = next && next.includes("-") ? next : normalizeCryptoPair(next || "BTC");
-                      setSymbol(pick);
-                      setSymbolQuery(pick);
-                      setNewsTab("market");
-                      setBt(null);
-                    }}
+  setAssetType("crypto");
+
+  // restore last crypto
+  const pick = normalizeCryptoPair(lastCryptoPair || "BTC-USD");
+  setSymbol(pick);
+  setSymbolQuery(pick);
+
+  setNewsTab("market");
+  setBt(null);
+}}
                     className={`px-3 py-3 text-xs font-medium transition ${
                       assetType === "crypto" ? "bg-zinc-100 text-zinc-900" : "text-zinc-300 hover:bg-zinc-900/50"
                     }`}
