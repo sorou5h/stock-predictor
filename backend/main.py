@@ -151,14 +151,26 @@ def normalize_timeframe(tf: str) -> str:
 
 def normalize_crypto_timeframe(tf: str) -> str:
     tf = (tf or "").strip().lower()
-    if tf not in ("hourly", "daily", "weekly"):
-        raise HTTPException(status_code=400, detail="crypto timeframe must be hourly, daily, or weekly")
+    # Supported crypto timeframes:
+    # - intraday: 1m, 5m, 15m, 1h
+    # - higher: daily, weekly
+    if tf in ("1h",):
+        tf = "hourly"
+    if tf not in ("1m", "5m", "15m", "hourly", "daily", "weekly"):
+        raise HTTPException(status_code=400, detail="crypto timeframe must be 1m, 5m, 15m, hourly (1h), daily, or weekly")
     return tf
 
 def default_horizons(tf: str) -> list[int]:
     return [1, 3, 5] if tf == "daily" else [1, 2, 4]
 
 def crypto_default_horizons(tf: str) -> list[int]:
+    # Horizons are expressed in "periods" of the selected timeframe.
+    if tf == "1m":
+        return [1, 5, 15]        # 1m ahead, 5m ahead, 15m ahead
+    if tf == "5m":
+        return [1, 3, 12]        # 5m, 15m, 60m
+    if tf == "15m":
+        return [1, 4, 16]        # 15m, 60m, 4h
     if tf == "hourly":
         return [1, 6, 24]
     if tf == "daily":
@@ -166,6 +178,13 @@ def crypto_default_horizons(tf: str) -> list[int]:
     return [1, 2, 4]
 
 def _coinbase_granularity(tf: str) -> int:
+    # Coinbase Exchange granularity allowed values include: 60, 300, 900, 3600, 21600, 86400
+    if tf == "1m":
+        return 60
+    if tf == "5m":
+        return 300
+    if tf == "15m":
+        return 900
     return 3600 if tf == "hourly" else 86400
 
 def _is_valid_crypto_pair(pair: str) -> bool:
@@ -174,6 +193,35 @@ def _is_valid_crypto_pair(pair: str) -> bool:
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
+
+# ----------------------------
+# Indicators (crypto)
+# ----------------------------
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _vwap(df: pd.DataFrame) -> pd.Series:
+    # Typical Price VWAP: (H+L+C)/3 weighted by volume
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    pv = tp * df["Volume"]
+    cum_pv = pv.cumsum()
+    cum_vol = df["Volume"].cumsum().replace(0, np.nan)
+    return cum_pv / cum_vol
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+
+    tr1 = (high - low).abs()
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    return tr.rolling(period).mean()
 
 # ----------------------------
 # Features
@@ -404,7 +452,7 @@ def fetch_coinbase_ohlcv(pair: str, tf: str) -> pd.DataFrame:
     data = r.json()
     # rows: [time, low, high, open, close, volume]
     if not isinstance(data, list) or len(data) < 10:
-        raise HTTPException(status_code=502, detail="Coinbase returned no candle data")
+        raise HTTPException(status_code=502, detail="Coinbase returned insufficient candle data (try daily/hourly or a different pair)")
 
     rows = []
     for row in data:
@@ -783,7 +831,7 @@ def crypto_history(pair: str, timeframe: str = "daily", points: int = 200):
 
     candles = [
         {
-            "time": d.strftime("%Y-%m-%d %H:%M") if tf == "hourly" else d.strftime("%Y-%m-%d"),
+            "time": d.strftime("%Y-%m-%d %H:%M") if tf in ("1m", "5m", "15m", "hourly") else d.strftime("%Y-%m-%d"),
             "open": float(o),
             "high": float(h),
             "low": float(l),
@@ -796,6 +844,114 @@ def crypto_history(pair: str, timeframe: str = "daily", points: int = 200):
     payload = {"pair": pair_u, "timeframe": tf, "candles": candles}
     cache_set(_hist_cache, key, payload)
     return payload
+@app.get("/crypto/quote/{pair}")
+def crypto_quote(pair: str, timeframe: str = "5m"):
+    pair_u = (pair or "").upper().strip()
+    if not _is_valid_crypto_pair(pair_u):
+        raise HTTPException(status_code=400, detail="Invalid crypto pair. Use format like BTC-USD")
+
+    tf = normalize_crypto_timeframe(timeframe)
+
+    # Pull only 2 candles to compute last price + change
+    df = get_crypto_df(pair_u, tf)
+    if len(df) < 2:
+        raise HTTPException(status_code=400, detail="Not enough history")
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    last_close = float(last["Close"])
+    prev_close = float(prev["Close"]) if float(prev["Close"]) != 0 else last_close
+    change_pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0.0
+
+    ts = last["Date"]
+    as_of = ts.strftime("%Y-%m-%d %H:%M") if tf in ("1m", "5m", "15m", "hourly") else ts.strftime("%Y-%m-%d")
+
+    return {
+        "pair": pair_u,
+        "timeframe": tf,
+        "as_of": as_of,
+        "last_close": round(last_close, 6),
+        "prev_close": round(prev_close, 6),
+        "change_pct": round(change_pct, 4),
+        "source": "coinbase",
+    }
+
+
+# ----------------------------
+# Crypto indicators endpoint
+# ----------------------------
+@app.get("/crypto/indicators/{pair}")
+def crypto_indicators(pair: str, timeframe: str = "5m", points: int = 200):
+    pair_u = (pair or "").upper().strip()
+    if not _is_valid_crypto_pair(pair_u):
+        raise HTTPException(status_code=400, detail="Invalid crypto pair. Use format like BTC-USD")
+
+    tf = normalize_crypto_timeframe(timeframe)
+    points = int(max(50, min(points, 1000)))
+
+    df = get_crypto_df(pair_u, tf).tail(points).copy()
+    if len(df) < 30:
+        raise HTTPException(status_code=400, detail="Not enough history")
+
+    # Compute indicators
+    df["ema9"] = _ema(df["Close"], 9)
+    df["ema21"] = _ema(df["Close"], 21)
+    df["vwap"] = _vwap(df)
+    df["atr14"] = _atr(df, 14)
+
+    last = df.iloc[-1]
+    price = float(last["Close"])
+    ema9 = float(last["ema9"])
+    ema21 = float(last["ema21"])
+    vwap = float(last["vwap"]) if np.isfinite(last["vwap"]) else float("nan")
+    atr14 = float(last["atr14"]) if np.isfinite(last["atr14"]) else float("nan")
+
+    # Simple starter signal logic
+    reasons = []
+    signal = "HOLD"
+    strength = 0.5
+
+    if ema9 > ema21:
+        reasons.append("ema9_above_ema21 (uptrend)")
+    else:
+        reasons.append("ema9_below_ema21 (downtrend)")
+
+    if np.isfinite(vwap):
+        if price > vwap:
+            reasons.append("price_above_vwap (bull bias)")
+        else:
+            reasons.append("price_below_vwap (bear bias)")
+
+    # Decide BUY/SELL when both align
+    if ema9 > ema21 and (not np.isfinite(vwap) or price > vwap):
+        signal = "BUY"
+        strength = 0.72
+    elif ema9 < ema21 and (not np.isfinite(vwap) or price < vwap):
+        signal = "SELL"
+        strength = 0.72
+
+    ts = last["Date"]
+    as_of = ts.strftime("%Y-%m-%d %H:%M") if tf in ("1m", "5m", "15m", "hourly") else ts.strftime("%Y-%m-%d")
+
+    return {
+        "pair": pair_u,
+        "timeframe": tf,
+        "as_of": as_of,
+        "points": int(len(df)),
+        "latest": {
+            "price": round(price, 6),
+            "ema9": round(ema9, 6),
+            "ema21": round(ema21, 6),
+            "vwap": round(vwap, 6) if np.isfinite(vwap) else None,
+            "atr14": round(atr14, 6) if np.isfinite(atr14) else None,
+        },
+        "signal": {
+            "action": signal,
+            "strength": strength,
+            "reasons": reasons,
+        },
+    }
 
 @app.post("/crypto/predict")
 def crypto_predict(req: CryptoPredictRequest):
@@ -804,6 +960,8 @@ def crypto_predict(req: CryptoPredictRequest):
         raise HTTPException(status_code=400, detail="Invalid crypto pair. Use format like BTC-USD")
 
     tf = normalize_crypto_timeframe(req.timeframe)
+    # Weekly uses daily candles aggregated later.
+    # Intraday (1m/5m/15m) and hourly are supported directly.
 
     requested_model = (req.model or DEFAULT_MODEL_TYPE).strip().lower()
     if requested_model not in ("rf", "torch"):
@@ -836,23 +994,31 @@ def crypto_predict(req: CryptoPredictRequest):
     model_key = f"model:crypto:{pair}:{tf}:{requested_model}"
     model_cached = cache_get(_model_cache, model_key, MODEL_CACHE_TTL_SEC)
 
+    trained_at = None  # ISO UTC string
     model_cache_hit = False
     model_obj = None
 
     if isinstance(model_cached, dict) and model_cached.get("last_date") == last_date_key:
         model_obj = model_cached.get("model")
         model_cache_hit = model_obj is not None
+        trained_at = model_cached.get("trained_at")
 
     if not model_cache_hit and requested_model == "torch" and TORCH_AVAILABLE:
         loaded = _torch_load(_torch_path(pair, tf))
         if loaded and (loaded.get("meta") or {}).get("last_date") == last_date_key:
             model_obj = loaded
             model_cache_hit = True
+            trained_at = (loaded.get("meta") or {}).get("trained_at")
 
     if not model_cache_hit:
+        trained_at = datetime.utcnow().isoformat() + "Z"
         if requested_model == "torch":
             model_obj = _torch_train_and_fit(X, y, epochs=60, lr=1e-3)
-            _torch_save(model_obj, _torch_path(pair, tf), meta={"last_date": last_date_key, "feature_cols": feature_cols})
+            _torch_save(
+                model_obj,
+                _torch_path(pair, tf),
+                meta={"last_date": last_date_key, "feature_cols": feature_cols, "trained_at": trained_at},
+            )
         else:
             model_obj = RandomForestRegressor(
                 n_estimators=160,
@@ -869,6 +1035,7 @@ def crypto_predict(req: CryptoPredictRequest):
             "last_date": last_date_key,
             "feature_cols": feature_cols,
             "model_type": requested_model,
+            "trained_at": trained_at,
         })
 
     bias_obj = _update_bias_from_latest_known(
@@ -919,6 +1086,7 @@ def crypto_predict(req: CryptoPredictRequest):
         "data_points": int(len(asset_df)),
         "source": "coinbase",
         "model_type": requested_model,
+        "trained_at": trained_at,
         "torch_available": TORCH_AVAILABLE,
         "learning": {
             "bias": round(bias, 4),
@@ -972,6 +1140,7 @@ def crypto_forecast(req: CryptoForecastRequest):
 
     last_close = float(pred_payload.get("last_close", asset_df["Close"].iloc[-1]))
     pred_next = float(pred_payload.get("prediction", last_close))
+    trained_at = pred_payload.get("trained_at")
 
     r1 = (pred_next / last_close - 1.0) if last_close else 0.0
 
@@ -1004,6 +1173,7 @@ def crypto_forecast(req: CryptoForecastRequest):
         "timeframe": tf,
         "last_close": round(last_close, 2),
         "as_of": last_date_key,
+        "trained_at": trained_at,
         "horizons": items,
         "source": "coinbase",
         "cache": {"ttl_sec": FORECAST_CACHE_TTL_SEC},
@@ -1071,12 +1241,14 @@ def predict(req: PredictRequest):
     model_key = f"model:{symbol}:{tf}:{requested_model}"
     model_cached = cache_get(_model_cache, model_key, MODEL_CACHE_TTL_SEC)
 
+    trained_at = None  # ISO UTC string
     model_cache_hit = False
     model_obj = None
 
     if isinstance(model_cached, dict) and model_cached.get("last_date") == last_date_key:
         model_obj = model_cached.get("model")
         model_cache_hit = model_obj is not None
+        trained_at = model_cached.get("trained_at")
 
     if not model_cache_hit:
         if requested_model == "torch" and TORCH_AVAILABLE:
@@ -1084,11 +1256,17 @@ def predict(req: PredictRequest):
             if loaded and (loaded.get("meta") or {}).get("last_date") == last_date_key:
                 model_obj = loaded
                 model_cache_hit = True
+                trained_at = (loaded.get("meta") or {}).get("trained_at")
 
     if not model_cache_hit:
+        trained_at = datetime.utcnow().isoformat() + "Z"
         if requested_model == "torch":
             model_obj = _torch_train_and_fit(X, y, epochs=60, lr=1e-3)
-            _torch_save(model_obj, _torch_path(symbol, tf), meta={"last_date": last_date_key, "feature_cols": feature_cols})
+            _torch_save(
+                model_obj,
+                _torch_path(symbol, tf),
+                meta={"last_date": last_date_key, "feature_cols": feature_cols, "trained_at": trained_at},
+            )
         else:
             p = tuned_params or {"n_estimators": 140, "max_depth": 12, "min_samples_leaf": 2, "max_features": "sqrt"}
             model_obj = RandomForestRegressor(
@@ -1106,6 +1284,7 @@ def predict(req: PredictRequest):
             "last_date": last_date_key,
             "feature_cols": feature_cols,
             "model_type": requested_model,
+            "trained_at": trained_at,
         })
 
     bias_obj = _update_bias_from_latest_known(
@@ -1155,6 +1334,7 @@ def predict(req: PredictRequest):
         "data_points": int(len(stock_df)),
         "source": "stooq",
         "model_type": requested_model,
+        "trained_at": trained_at,
         "torch_available": TORCH_AVAILABLE,
         "learning": {
             "bias": round(bias, 4),
@@ -1220,6 +1400,7 @@ def forecast(req: ForecastRequest):
 
     last_close = float(pred_payload.get("last_close", stock_df["Close"].iloc[-1]))
     pred_next = float(pred_payload.get("prediction", last_close))
+    trained_at = pred_payload.get("trained_at")
 
     r1 = (pred_next / last_close - 1.0) if last_close else 0.0
 
@@ -1252,6 +1433,7 @@ def forecast(req: ForecastRequest):
         "timeframe": tf,
         "last_close": round(last_close, 2),
         "as_of": last_date_key,
+        "trained_at": trained_at,
         "horizons": items,
         "source": "stooq",
         "cache": {"ttl_sec": FORECAST_CACHE_TTL_SEC},
