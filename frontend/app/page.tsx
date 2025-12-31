@@ -16,7 +16,8 @@ type AssetType = "stock" | "crypto";
 type PredictResponse = {
   symbol?: string; // stocks
   pair?: string; // crypto
-  timeframe: "daily" | "weekly" | "hourly";
+  timeframe: string; // ✅ allow intraday like 1m/5m/15m/1h
+  trained_at?: string; // ISO datetime string when the model was trained
   last_close: number;
   prediction: number;
   range_low: number;
@@ -45,7 +46,7 @@ type ForecastItem = {
 type ForecastResponse = {
   symbol?: string;
   pair?: string;
-  timeframe: "daily" | "weekly" | "hourly";
+  timeframe: string; // ✅ allow intraday
   last_close: number;
   as_of: string;
   horizons: ForecastItem[];
@@ -55,7 +56,7 @@ type ForecastResponse = {
 type HistoryResponse = {
   symbol?: string;
   pair?: string;
-  timeframe: "daily" | "weekly" | "hourly";
+  timeframe: string; // ✅ allow intraday
   candles: {
     time: string;
     open: number;
@@ -108,7 +109,7 @@ type CryptoSymbolsResponse = {
 
 type BacktestResponse = {
   symbol: string;
-  timeframe: "daily" | "weekly";
+  timeframe: string; // ✅ allow intraday typing safely (backend may still be daily/weekly)
   as_of: string;
   day_bucket: string;
   ok: boolean;
@@ -132,7 +133,6 @@ function Skeleton({ className = "" }: { className?: string }) {
     />
   );
 }
-
 
 function fmtMoney(n: number) {
   return n.toLocaleString(undefined, {
@@ -195,7 +195,6 @@ function SegmentedToggle({
   );
 }
 
-
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
 }
@@ -214,6 +213,34 @@ function safeToFixed(x: any, digits = 2, fallback = "—") {
   if (x === null || x === undefined) return fallback;
   const n = Number(x);
   return Number.isFinite(n) ? n.toFixed(digits) : fallback;
+}
+
+// ✅ live polling interval based on timeframe
+function livePollMs(tf: string) {
+  const t = String(tf || "").toLowerCase();
+  if (t === "1m") return 7_000;
+  if (t === "3m" || t === "5m") return 10_000;
+  if (t === "15m") return 20_000;
+  if (t === "30m" || t === "45m") return 30_000;
+  if (["60m", "90m", "1h", "2h", "4h", "hourly"].includes(t)) return 45_000;
+  if (t === "daily") return 60_000;
+  if (t === "weekly") return 120_000;
+  return 30_000;
+}
+
+// ✅ prediction interval based on timeframe (safer/slower than live quote polling)
+function predictPollMs(tf: string) {
+  const t = String(tf || "").toLowerCase();
+  if (t === "1m") return 60_000;
+  if (t === "3m") return 180_000;
+  if (t === "5m") return 300_000;
+  if (t === "15m") return 900_000;
+  if (t === "30m") return 1_800_000;
+  if (t === "45m") return 2_700_000;
+  if (["60m", "90m", "1h", "2h", "4h", "hourly"].includes(t)) return 3_600_000;
+  if (t === "daily") return 3_600_000;
+  if (t === "weekly") return 6_000_000;
+  return 300_000;
 }
 
 // --- Simple indicators (client-side, from fetched candles) ---
@@ -259,13 +286,25 @@ function atr(highs: number[], lows: number[], closes: number[], period = 14) {
 
 export default function Home() {
   const [symbol, setSymbol] = useState("AAPL");
-  const [timeframe, setTimeframe] = useState<"daily" | "weekly">("daily");
+  const [timeframe, setTimeframe] = useState<string>("daily"); // ✅ allow intraday
   const [assetType, setAssetType] = useState<AssetType>("stock");
   const [lastStockSymbol, setLastStockSymbol] = useState("AAPL");
   const [lastCryptoPair, setLastCryptoPair] = useState("BTC-USD");
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState<string | null>(null);
   const [pred, setPred] = useState<PredictResponse | null>(null);
+
+type PredLogItem = {
+  at: string; // when prediction was made (ISO)
+  timeframe: string;
+  candle_time: string | null; // candle timestamp used for the prediction (best-effort)
+  last_close: number;
+  prediction: number;
+  confidence: number;
+};
+
+const [predLog, setPredLog] = useState<PredLogItem[]>([]);
+
   const [hist, setHist] = useState<HistoryResponse | null>(null);
   const [forecast, setForecast] = useState<ForecastResponse | null>(null);
 
@@ -280,6 +319,10 @@ export default function Home() {
   const [liveUpdatedAt, setLiveUpdatedAt] = useState<string | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Auto prediction (optional day-trading mode)
+const [autoPredict, setAutoPredict] = useState(false);
+const [lastPredictedAt, setLastPredictedAt] = useState<string | null>(null);
+const [lastAutoTickAt, setLastAutoTickAt] = useState<string | null>(null);
 
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
@@ -303,6 +346,46 @@ export default function Home() {
   const [comboOpen, setComboOpen] = useState(false);
 
   const candles = useMemo(() => hist?.candles ?? [], [hist]);
+
+  // ✅ formatted candle timestamp helper (uses current timeframe)
+  function fmtCandleTime(s: any) {
+    const raw = String(s ?? "").trim();
+    if (!raw) return "—";
+
+    const d = new Date(raw);
+    if (!Number.isNaN(d.getTime())) {
+      const tf = String(timeframe || "").toLowerCase();
+      const isIntraday = [
+        "1m",
+        "3m",
+        "5m",
+        "15m",
+        "30m",
+        "45m",
+        "60m",
+        "90m",
+        "1h",
+        "2h",
+        "4h",
+        "hourly",
+      ].includes(tf);
+
+      return isIntraday
+        ? d.toLocaleString(undefined, {
+            month: "short",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : d.toLocaleDateString(undefined, {
+            year: "numeric",
+            month: "short",
+            day: "2-digit",
+          });
+    }
+
+    return raw;
+  }
 
   const insights = useMemo(() => {
     const cs = candles ?? [];
@@ -446,7 +529,52 @@ export default function Home() {
     }));
   }, [candles]);
 
-  function expectedMovePct(rangeLow: number, rangeHigh: number, lastClose: number) {
+  const combinedPredRows = useMemo(() => {
+  const cs = candles ?? [];
+  if (!cs.length || !predLog.length) return [];
+
+  const indexByTime = new Map<string, number>();
+  for (let i = 0; i < cs.length; i++) {
+    const t = String(cs[i].time ?? "");
+    if (t) indexByTime.set(t, i);
+  }
+
+  return predLog.map((p) => {
+    const t = p.candle_time ? String(p.candle_time) : "";
+    const idx = t ? indexByTime.get(t) : undefined;
+
+    // fall back to latest candle if exact timestamp doesn’t match
+    const baseIdx = typeof idx === "number" ? idx : cs.length - 1;
+    const c = cs[baseIdx];
+    const nextC = baseIdx + 1 < cs.length ? cs[baseIdx + 1] : null;
+
+    const candleClose = safeNum(c?.close);
+    const predVal = safeNum(p.prediction);
+    const predCh = candleClose ? ((predVal - candleClose) / candleClose) * 100 : 0;
+
+    const actualNextClose = nextC ? safeNum(nextC.close) : null;
+    const errPct =
+      actualNextClose !== null ? ((predVal - actualNextClose) / actualNextClose) * 100 : null;
+
+    return {
+      predAt: p.at,
+      tf: p.timeframe,
+      candleTime: String(c?.time ?? p.candle_time ?? ""),
+      candleClose,
+      predVal,
+      predCh,
+      actualNextClose,
+      errPct,
+      conf: safeNum(p.confidence),
+    };
+  }).slice(0, 10);
+}, [candles, predLog]);
+
+  function expectedMovePct(
+    rangeLow: number,
+    rangeHigh: number,
+    lastClose: number
+  ) {
     const w = Math.max(0, rangeHigh - rangeLow);
     if (!lastClose || lastClose === 0) return 0;
     return (w / lastClose) * 100;
@@ -469,12 +597,22 @@ export default function Home() {
   }
 
   useEffect(() => {
-    if (assetType === "crypto") {
-      setLastCryptoPair(normalizeCryptoPair(symbol));
-    } else {
-      setLastStockSymbol(((symbol || "").trim().toUpperCase() || "AAPL"));
-    }
-  }, [symbol, assetType]);
+  if (!pred) return;
+
+  const item: PredLogItem = {
+    at: new Date().toISOString(),
+    timeframe: pred.timeframe ?? timeframe,
+    last_close: Number(pred.last_close),
+    prediction: Number(pred.prediction),
+    confidence: Number(pred.confidence),
+    candle_time: null,
+  };
+
+  setPredLog((prev) => {
+    const next = [item, ...prev];
+    return next.slice(0, 10); // keep last 10 only
+  });
+}, [pred]);
 
   function displaySymbol() {
     return (pred?.symbol ?? pred?.pair ?? symbol).toString().toUpperCase();
@@ -524,6 +662,26 @@ export default function Home() {
     const t = hist?.candles?.[hist.candles.length - 1]?.time;
     setLastUpdated(t ?? null);
   }, [hist]);
+
+  useEffect(() => {
+  if (!pred) return;
+
+  const candleTime =
+    hist?.candles && hist.candles.length > 0
+      ? String(hist.candles[hist.candles.length - 1].time ?? "")
+      : null;
+
+  const item: PredLogItem = {
+    at: new Date().toISOString(),
+    timeframe: pred.timeframe ?? timeframe,
+    candle_time: candleTime,
+    last_close: Number(pred.last_close),
+    prediction: Number(pred.prediction),
+    confidence: Number(pred.confidence),
+  };
+
+  setPredLog((prev) => [item, ...prev].slice(0, 10));
+}, [pred, hist, timeframe]);
 
   useEffect(() => {
     setSymbolQuery(symbol);
@@ -639,7 +797,7 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol]);
 
-  async function run() {
+  async function run(opts?: { silent?: boolean }) {
     const raw = symbol.trim().toUpperCase();
     const s = isCrypto() ? normalizeCryptoPair(raw) : raw;
     if (!s) return;
@@ -650,12 +808,21 @@ export default function Home() {
     // Auto-check accuracy (daily cached) - stocks only
     runBacktest(false, s);
 
-    setLoading(true);
-    setError(null);
-    // Clear previous results so we don't render stale objects while loading
-    setPred(null);
-    setHist(null);
-    setForecast(null);
+    const silent = !!opts?.silent;
+
+// In silent mode, do NOT clear the UI and do NOT show the big loading state.
+if (!silent) {
+  setLoading(true);
+}
+
+setError(null);
+
+if (!silent) {
+  // Clear previous results so we don't render stale objects while loading
+  setPred(null);
+  setHist(null);
+  setForecast(null);
+}
 
     const startedAt = Date.now();
 
@@ -680,12 +847,15 @@ export default function Home() {
 
     const steps = assetType === "crypto" ? stepsCrypto : stepsStock;
 
-    setLoadingMsg(steps[0]);
-    let i = 0;
-    const timer = setInterval(() => {
-      i = (i + 1) % steps.length;
-      setLoadingMsg(steps[i]);
-    }, 1200);
+    let timer: any = null;
+if (!silent) {
+  setLoadingMsg(steps[0]);
+  let i = 0;
+  timer = setInterval(() => {
+    i = (i + 1) % steps.length;
+    setLoadingMsg(steps[i]);
+  }, 1200);
+}
 
     try {
       const [predRes, histRes, fcRes] = await Promise.all([
@@ -722,10 +892,12 @@ export default function Home() {
         e?.message ??
           `Network error (is backend running on ${API_BASE}/health ?)`
       );
-      setPred(null);
-      setHist(null);
-      setForecast(null);
-      setBt(null);
+      if (!silent) {
+  setPred(null);
+  setHist(null);
+  setForecast(null);
+  setBt(null);
+}
     } finally {
       const elapsed = Date.now() - startedAt;
       const minShowMs = 900;
@@ -733,9 +905,12 @@ export default function Home() {
         await new Promise((r) => setTimeout(r, minShowMs - elapsed));
       }
 
-      clearInterval(timer);
-      setLoading(false);
-      setLoadingMsg(null);
+      if (timer) clearInterval(timer);
+if (!silent) {
+  setLoading(false);
+  setLoadingMsg(null);
+}
+setLastPredictedAt(new Date().toLocaleString());
     }
   }
 
@@ -793,10 +968,10 @@ export default function Home() {
 
       const lastClose = Number(last.close);
       const prevClose = prev ? Number(prev.close) : lastClose;
-      const pct = prevClose ? ((lastClose - prevClose) / prevClose) * 100 : 0;
+      const pctCh = prevClose ? ((lastClose - prevClose) / prevClose) * 100 : 0;
 
       setLivePrice(lastClose);
-      setLiveChangePct(pct);
+      setLiveChangePct(pctCh);
       setLiveUpdatedAt(new Date().toLocaleTimeString());
     } catch {
       setLivePrice(null);
@@ -807,13 +982,26 @@ export default function Home() {
     }
   }
 
-  // Poll live price every 30s (updates when symbol/timeframe changes)
-  useEffect(() => {
-    fetchLiveQuote();
-    const id = window.setInterval(() => fetchLiveQuote(), 30_000);
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, timeframe, assetType]);
+  // ✅ Auto-run prediction on an interval (optional)
+useEffect(() => {
+  if (!autoPredict) return;
+  if (!symbol) return;
+
+  // Run once immediately (silent) when toggled on / dependencies change
+  run({ silent: true });
+  setLastAutoTickAt(new Date().toLocaleTimeString());
+
+  const ms = predictPollMs(timeframe);
+  const id = window.setInterval(() => {
+    // Avoid stacking if a manual run is in progress
+    if (loading) return;
+    run({ silent: true });
+    setLastAutoTickAt(new Date().toLocaleTimeString());
+  }, ms);
+
+  return () => window.clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [autoPredict, symbol, timeframe, assetType]);
 
   const changePct =
     pred ? ((pred.prediction - pred.last_close) / pred.last_close) * 100 : null;
@@ -862,8 +1050,6 @@ export default function Home() {
     return { label: "Low", tone: "bad" as const };
   }
 
-  // (expectedMovePct is now defined above in the "under the chart" helpers)
-
   function riskLabelFromMove(movePct: number) {
     if (movePct >= 6) return { label: "High", tone: "bad" as const };
     if (movePct >= 3) return { label: "Medium", tone: "neutral" as const };
@@ -883,8 +1069,19 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
-      <div className="max-w-5xl mx-auto p-6">
-        <header className="flex flex-col gap-2">
+      <div className="w-full max-w-[1680px] mx-auto px-4 sm:px-6 lg:px-10 py-6">
+        <header className="relative flex flex-col gap-2">
+          {/* Model trained timestamp (top-right) */}
+          <div className="absolute top-0 right-0 text-[11px] text-zinc-400 text-right">
+            <div className="font-medium text-zinc-300">🧠 Model trained</div>
+            <div>
+              {pred?.trained_at
+                ? new Date(pred.trained_at).toLocaleString()
+                : forecast?.as_of
+                ? new Date(forecast.as_of).toLocaleString()
+                : "—"}
+            </div>
+          </div>
           <h1 className="text-3xl font-semibold tracking-tight">
             Market Predictor
           </h1>
@@ -893,7 +1090,6 @@ export default function Home() {
             market context (SPY/QQQ). Crypto runs without SPY/QQQ context. Not
             financial advice.
           </p>
-
           <div className="mt-2 flex flex-wrap gap-2 text-xs">
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Backend:{" "}
@@ -916,13 +1112,17 @@ export default function Home() {
 
                   if (next === "stock") {
                     setAssetType("stock");
-                    const pick = (lastStockSymbol || "AAPL").trim().toUpperCase();
+                    const pick = (lastStockSymbol || "AAPL")
+                      .trim()
+                      .toUpperCase();
                     setSymbol(pick);
                     setSymbolQuery(pick);
                     setNewsTab("market");
                   } else {
                     setAssetType("crypto");
-                    const pick = normalizeCryptoPair(lastCryptoPair || "BTC-USD");
+                    const pick = normalizeCryptoPair(
+                      lastCryptoPair || "BTC-USD"
+                    );
                     setSymbol(pick);
                     setSymbolQuery(pick);
                     setNewsTab("market");
@@ -938,7 +1138,7 @@ export default function Home() {
               Mode: {timeframe}
             </span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
-              Updated: {lastUpdated ?? "—"}
+              Updated: {lastUpdated ? fmtCandleTime(lastUpdated) : "—"}
             </span>
             <span className="px-2 py-1 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-300">
               Cache: {pred?.cache?.hit ? "hit" : pred ? "miss" : "—"}
@@ -990,8 +1190,8 @@ export default function Home() {
           </div>
         </header>
 
-        <section className="mt-6 grid grid-cols-1 md:grid-cols-5 gap-4">
-          <div className="md:col-span-3 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
+        <section className="mt-6 grid grid-cols-1 md:grid-cols-12 gap-4">
+          <div className="md:col-span-8 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex gap-3 w-full">
                 <div className="relative flex-1">
@@ -1005,7 +1205,12 @@ export default function Home() {
                     onFocus={() => setComboOpen(true)}
                     onBlur={() => {
                       setTimeout(() => setComboOpen(false), 150);
-                      setSymbol(symbolQuery.trim().toUpperCase());
+                      // ✅ normalize on blur for crypto and stocks
+                      const raw = symbolQuery.trim().toUpperCase();
+                      const normalized =
+                        assetType === "crypto" ? normalizeCryptoPair(raw) : raw;
+                      setSymbol(normalized);
+                      setSymbolQuery(normalized);
                     }}
                     placeholder={
                       assetType === "crypto"
@@ -1038,21 +1243,19 @@ export default function Home() {
                             </div>
                           ) : (
                             filteredSymbols.map((it: any) => {
-                              const displaySymbol = String(
-                                it.pair ?? ""
-                              ).toUpperCase();
+                              const displaySym = String(it.pair ?? "").toUpperCase();
                               const displayName = it.name
                                 ? String(it.name)
                                 : "Cryptocurrency";
 
                               return (
                                 <button
-                                  key={displaySymbol}
+                                  key={displaySym}
                                   type="button"
                                   onMouseDown={(e) => e.preventDefault()}
                                   onClick={() => {
-                                    setSymbol(displaySymbol);
-                                    setSymbolQuery(displaySymbol);
+                                    setSymbol(displaySym);
+                                    setSymbolQuery(displaySym);
                                     setComboOpen(false);
                                   }}
                                   className="w-full text-left px-4 py-3 hover:bg-zinc-900/60 border-b border-zinc-900/50 last:border-b-0"
@@ -1060,7 +1263,7 @@ export default function Home() {
                                   <div className="flex items-center justify-between gap-3">
                                     <div className="min-w-0">
                                       <div className="text-sm font-semibold text-zinc-100 truncate">
-                                        {displaySymbol}
+                                        {displaySym}
                                         <span className="ml-2 text-xs font-normal text-zinc-400 truncate">
                                           {displayName}
                                         </span>
@@ -1088,7 +1291,7 @@ export default function Home() {
                           </div>
                         ) : (
                           filteredSymbols.map((it: any) => {
-                            const displaySymbol = String(
+                            const displaySym = String(
                               (it.symbol_alt ?? it.symbol) ?? ""
                             ).toUpperCase();
                             const displayName = String(it.name ?? "");
@@ -1098,12 +1301,12 @@ export default function Home() {
 
                             return (
                               <button
-                                key={displaySymbol}
+                                key={displaySym}
                                 type="button"
                                 onMouseDown={(e) => e.preventDefault()}
                                 onClick={() => {
-                                  setSymbol(displaySymbol);
-                                  setSymbolQuery(displaySymbol);
+                                  setSymbol(displaySym);
+                                  setSymbolQuery(displaySym);
                                   setComboOpen(false);
                                 }}
                                 className="w-full text-left px-4 py-3 hover:bg-zinc-900/60 border-b border-zinc-900/50 last:border-b-0"
@@ -1111,7 +1314,7 @@ export default function Home() {
                                 <div className="flex items-center justify-between gap-3">
                                   <div className="min-w-0">
                                     <div className="text-sm font-semibold text-zinc-100 truncate">
-                                      {displaySymbol}
+                                      {displaySym}
                                       <span className="ml-2 text-xs font-normal text-zinc-400 truncate">
                                         {displayName}
                                       </span>
@@ -1152,19 +1355,39 @@ export default function Home() {
                 <select
                   className="rounded-xl bg-zinc-950 border border-zinc-800 px-3 py-3 outline-none focus:ring-2 focus:ring-zinc-600"
                   value={timeframe}
-                  onChange={(e) => setTimeframe(e.target.value as any)}
+                  onChange={(e) => setTimeframe(e.target.value)}
                 >
+                  <option value="1m">1m</option>
+                  <option value="5m">5m</option>
+                  <option value="15m">15m</option>
+                  <option value="1h">1h</option>
+                  <option value="hourly">Hourly</option>
                   <option value="daily">Daily</option>
                   <option value="weekly">Weekly</option>
                 </select>
 
-                <button
-                  onClick={run}
-                  disabled={loading}
-                  className="rounded-xl px-5 py-3 bg-zinc-100 text-zinc-900 font-medium hover:bg-white disabled:opacity-60"
-                >
-                  {loading ? "Running..." : "Predict"}
-                </button>
+                <div className="flex items-center gap-2">
+  <button
+    onClick={() => run()}
+    disabled={loading}
+    className="rounded-xl px-5 py-3 bg-zinc-100 text-zinc-900 font-medium hover:bg-white disabled:opacity-60"
+  >
+    {loading ? "Running..." : "Predict"}
+  </button>
+
+  <button
+    type="button"
+    onClick={() => setAutoPredict((v) => !v)}
+    className={`rounded-xl px-3 py-3 text-xs font-medium border transition ${
+      autoPredict
+        ? "border-emerald-700 bg-emerald-950/40 text-emerald-200"
+        : "border-zinc-800 bg-zinc-950 text-zinc-300 hover:bg-zinc-900/50"
+    }`}
+    title="Auto re-run prediction on an interval based on timeframe"
+  >
+    {autoPredict ? "Auto: ON" : "Auto: OFF"}
+  </button>
+</div>
               </div>
             </div>
 
@@ -1219,18 +1442,20 @@ export default function Home() {
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                     <div className="text-xs text-zinc-500">Change</div>
                     <div className="mt-1 text-lg font-semibold">
-                    {changePct === null ? (
-                      "—"
-                    ) : (
-                      <span
-                        className={
-                          changePct >= 0 ? "text-emerald-200" : "text-red-200"
-                        }
-                      >
-                        {changePct >= 0 ? "+" : ""}
-                        {safeToFixed(changePct, 2, "0.00")}%
-                      </span>
-                    )}
+                      {changePct === null ? (
+                        "—"
+                      ) : (
+                        <span
+                          className={
+                            changePct >= 0
+                              ? "text-emerald-200"
+                              : "text-red-200"
+                          }
+                        >
+                          {changePct >= 0 ? "+" : ""}
+                          {safeToFixed(changePct, 2, "0.00")}%
+                        </span>
+                      )}
                     </div>
                   </div>
                   <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
@@ -1295,14 +1520,15 @@ export default function Home() {
                 </div>
               ) : (
                 <CandleChart
-                  candles={candles.map(({ time, open, high, low, close }) => ({
-                    time,
-                    open,
-                    high,
-                    low,
-                    close,
-                  }))}
-                />
+  timeframe={timeframe}
+  candles={candles.map(({ time, open, high, low, close }) => ({
+    time,
+    open,
+    high,
+    low,
+    close,
+  }))}
+/>
               )}
             </div>
 
@@ -1333,7 +1559,9 @@ export default function Home() {
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="text-[11px] text-zinc-500">Volatility (avg move)</div>
                   <div className="mt-1 text-sm text-zinc-200">
-                    {insights.ok ? `~${safeToFixed(insights.volPct, 2, "0.00")}%` : "—"}
+                    {insights.ok
+                      ? `~${safeToFixed(insights.volPct, 2, "0.00")}%`
+                      : "—"}
                   </div>
                 </div>
 
@@ -1362,7 +1590,9 @@ export default function Home() {
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="text-[11px] text-zinc-500">Volume vs avg</div>
                   <div className="mt-1 text-sm">
-                    {insights.ok && insights.volNow !== null && insights.volAvg !== null ? (
+                    {insights.ok &&
+                    insights.volNow !== null &&
+                    insights.volAvg !== null ? (
                       <span
                         className={
                           insights.volTone === "good"
@@ -1373,7 +1603,11 @@ export default function Home() {
                         }
                       >
                         {insights.volAvg
-                          ? `${safeToFixed(insights.volNow / insights.volAvg, 2, "0.00")}×`
+                          ? `${safeToFixed(
+                              insights.volNow / insights.volAvg,
+                              2,
+                              "0.00"
+                            )}×`
                           : "—"}
                       </span>
                     ) : (
@@ -1405,7 +1639,9 @@ export default function Home() {
                   </div>
 
                   {!signal.ok ? (
-                    <div className="mt-3 text-sm text-zinc-500">Run a prediction to compute indicators.</div>
+                    <div className="mt-3 text-sm text-zinc-500">
+                      Run a prediction to compute indicators.
+                    </div>
                   ) : (
                     <div className="mt-3 grid grid-cols-2 gap-2">
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
@@ -1439,21 +1675,33 @@ export default function Home() {
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                         <div className="text-[11px] text-zinc-500">Return (5)</div>
                         <div
-                          className={`mt-1 text-sm font-semibold ${(signal.ret5 ?? 0) >= 0 ? "text-emerald-200" : "text-red-200"}`}
+                          className={`mt-1 text-sm font-semibold ${
+                            (signal.ret5 ?? 0) >= 0 ? "text-emerald-200" : "text-red-200"
+                          }`}
                         >
                           {signal.ret5 === null
                             ? "—"
-                            : `${signal.ret5 >= 0 ? "+" : ""}${safeToFixed(signal.ret5, 2, "0.00")}%`}
+                            : `${signal.ret5 >= 0 ? "+" : ""}${safeToFixed(
+                                signal.ret5,
+                                2,
+                                "0.00"
+                              )}%`}
                         </div>
                       </div>
                       <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                         <div className="text-[11px] text-zinc-500">Return (20)</div>
                         <div
-                          className={`mt-1 text-sm font-semibold ${(signal.ret20 ?? 0) >= 0 ? "text-emerald-200" : "text-red-200"}`}
+                          className={`mt-1 text-sm font-semibold ${
+                            (signal.ret20 ?? 0) >= 0 ? "text-emerald-200" : "text-red-200"
+                          }`}
                         >
                           {signal.ret20 === null
                             ? "—"
-                            : `${signal.ret20 >= 0 ? "+" : ""}${safeToFixed(signal.ret20, 2, "0.00")}%`}
+                            : `${signal.ret20 >= 0 ? "+" : ""}${safeToFixed(
+                                signal.ret20,
+                                2,
+                                "0.00"
+                              )}%`}
                         </div>
                       </div>
 
@@ -1481,73 +1729,134 @@ export default function Home() {
                     </div>
                   )}
 
+                  {/* Session & Auto-predict status */}
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Auto prediction</div>
+                      <div className="mt-1 text-sm font-semibold">
+                        <span className={autoPredict ? "text-emerald-200" : "text-zinc-300"}>
+                          {autoPredict ? "ON" : "OFF"}
+                        </span>
+                        <span className="ml-2 text-xs text-zinc-500">
+                          ({Math.round(predictPollMs(timeframe) / 1000)}s)
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Last prediction</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {lastPredictedAt ?? <span className="text-zinc-600">—</span>}
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Last auto tick</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {lastAutoTickAt ?? <span className="text-zinc-600">—</span>}
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Prediction log</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {predLog.length} entries
+                        <span className="ml-1 text-xs text-zinc-500">(last 10)</span>
+                      </div>
+                    </div>
+                  </div>
                   <p className="mt-3 text-[11px] text-zinc-600 leading-relaxed">
                     These are simple technical indicators computed from the last 200 candles (not advice).
                   </p>
                 </div>
-
+                {/* Execution Context (fills empty right side next to Levels & Signals) */}
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
-                  <div className="text-xs text-zinc-500">Recent candles (last 10)</div>
-                  {recentRows.length === 0 ? (
-                    <div className="mt-3 text-sm text-zinc-500">No candle history yet.</div>
-                  ) : (
-                    <div className="mt-3 rounded-lg border border-zinc-800 overflow-hidden">
-                      <div className="max-h-64 overflow-auto">
-                        <table className="w-full table-fixed">
-                          <colgroup>
-                            <col style={{ width: "40%" }} />
-                            <col style={{ width: "22%" }} />
-                            <col style={{ width: "22%" }} />
-                            <col style={{ width: "16%" }} />
-                          </colgroup>
-                          <thead className="sticky top-0 z-10 bg-zinc-900/60 backdrop-blur">
-                            <tr className="text-[11px] text-zinc-500">
-                              <th className="text-left font-medium px-3 py-2">Time</th>
-                              <th className="text-right font-medium px-3 py-2 tabular-nums">Open</th>
-                              <th className="text-right font-medium px-3 py-2 tabular-nums">Close</th>
-                              <th className="text-right font-medium px-3 py-2 tabular-nums">Vol</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {recentRows.map((r, idx) => (
-                              <tr
-                                key={idx}
-                                className="border-t border-zinc-900/60 text-xs align-middle"
-                              >
-                                <td className="px-3 py-2 text-zinc-400 whitespace-nowrap truncate">
-                                  {r.time}
-                                </td>
-                                <td className="px-3 py-2 text-right text-zinc-300 tabular-nums whitespace-nowrap">
-                                  ${fmtMoney(r.open)}
-                                </td>
-                                <td
-                                  className={`px-3 py-2 text-right font-medium tabular-nums whitespace-nowrap ${
-                                    r.up ? "text-emerald-200" : "text-red-200"
-                                  }`}
-                                >
-                                  ${fmtMoney(r.close)}
-                                </td>
-                                <td className="px-3 py-2 text-right text-zinc-500 tabular-nums whitespace-nowrap">
-                                  {fmtVol(r.volume)}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs text-zinc-500">Execution Context</div>
+                    <span className="text-[11px] text-zinc-400">
+                      {assetType === "crypto" ? "Crypto 24/7" : "Equities"}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Session</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {assetType === "crypto"
+                          ? "Always open"
+                          : (() => {
+                              // Local time (Toronto) is fine for display; you can switch to ET if you later want.
+                              const d = new Date();
+                              const h = d.getHours();
+                              const m = d.getMinutes();
+                              const mins = h * 60 + m;
+                              if (mins < 9 * 60 + 30) return "Pre-market";
+                              if (mins < 16 * 60) return "Regular";
+                              return "After-hours";
+                            })()}
                       </div>
                     </div>
-                  )}
+
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Candle age</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {lastUpdated && !Number.isNaN(new Date(lastUpdated).getTime())
+                          ? `${Math.max(
+                              0,
+                              Math.floor((Date.now() - new Date(lastUpdated).getTime()) / 1000)
+                            )}s ago`
+                          : "—"}
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Auto cadence</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {autoPredict
+                          ? `${Math.round(predictPollMs(timeframe) / 1000)}s`
+                          : "Disabled"}
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Log</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {predLog.length} entries
+                        <span className="ml-1 text-xs text-zinc-500">(last 10)</span>
+                      </div>
+                    </div>
+
+                    <div className="col-span-2 rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Last prediction</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {lastPredictedAt ?? <span className="text-zinc-600">—</span>}
+                      </div>
+                    </div>
+
+                    <div className="col-span-2 rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
+                      <div className="text-[11px] text-zinc-500">Last auto tick</div>
+                      <div className="mt-1 text-sm text-zinc-200">
+                        {lastAutoTickAt ?? <span className="text-zinc-600">—</span>}
+                      </div>
+                    </div>
+                  </div>
+
+                 
                 </div>
               </div>
 
               {/* Meta line */}
               <div className="text-xs text-zinc-500">
-                Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last {candles.length || 0} candles
+                Source: {pred?.source ?? "—"} • Timeframe: {timeframe} • Last{" "}
+                {candles.length || 0} candles
               </div>
             </div>
           </div>
 
-          <div className="md:col-span-2 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
+          {/* RIGHT COLUMN (Forecast, Breakdown, Backtest, News) */}
+          {/* ✅ untouched below except it now benefits from timeframe being string */}
+          {/* NOTE: Keeping your existing content as-is (no feature loss). */}
+          <div className="md:col-span-4 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
             <h2 className="text-sm font-medium text-zinc-300">Forecast</h2>
 
             {!pred ? (
@@ -1594,7 +1903,9 @@ export default function Home() {
                         const label =
                           timeframe === "daily"
                             ? `${it.horizon}D`
-                            : `${it.horizon}W`;
+                            : timeframe === "weekly"
+                            ? `${it.horizon}W`
+                            : `${it.horizon}`; // ✅ intraday: keep numeric horizon label
                         return (
                           <div
                             key={it.horizon}
@@ -1637,17 +1948,18 @@ export default function Home() {
                 <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <div className="text-xs text-zinc-500">Expected range</div>
                   <div className="text-base font-semibold">
-                    ${fmtMoney(safeNum(pred.range_low))} — ${fmtMoney(safeNum(pred.range_high))}
+                    ${fmtMoney(safeNum(pred.range_low))} — $
+                    {fmtMoney(safeNum(pred.range_high))}
                   </div>
-                    <div className="mt-1 text-xs text-zinc-500">
-                      Confidence: {safeToFixed(pred.confidence * 100, 0, "0")}%
-                      {changePct !== null && (
-                        <span className="ml-2">
-                          • Change: {changePct >= 0 ? "+" : ""}
-                          {safeToFixed(changePct, 2, "0.00")}%
-                        </span>
-                      )}
-                    </div>
+                  <div className="mt-1 text-xs text-zinc-500">
+                    Confidence: {safeToFixed(pred.confidence * 100, 0, "0")}%
+                    {changePct !== null && (
+                      <span className="ml-2">
+                        • Change: {changePct >= 0 ? "+" : ""}
+                        {safeToFixed(changePct, 2, "0.00")}%
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {/* Prediction Breakdown */}
@@ -1665,12 +1977,12 @@ export default function Home() {
                   <div className="mt-3 grid grid-cols-2 gap-2">
                     {(() => {
                       const dir = pred.prediction - pred.last_close;
-                      const pct = (dir / pred.last_close) * 100;
-                      const tone = pctTone(pct);
+                      const pctCh = (dir / pred.last_close) * 100;
+                      const tone = pctTone(pctCh);
                       const label =
-                        pct >= 0
-                          ? `Bullish (${safeToFixed(pct, 2, "0.00")}%)`
-                          : `Bearish (${safeToFixed(pct, 2, "0.00")}%)`;
+                        pctCh >= 0
+                          ? `Bullish (${safeToFixed(pctCh, 2, "0.00")}%)`
+                          : `Bearish (${safeToFixed(pctCh, 2, "0.00")}%)`;
                       return (
                         <div className="rounded-lg border border-zinc-800 bg-zinc-900/20 p-2">
                           <div className="text-[11px] text-zinc-500">
@@ -1722,7 +2034,10 @@ export default function Home() {
                             Expected move
                           </div>
                           <div className="mt-1 flex flex-wrap items-center gap-2">
-                            {toneBadge(`~${safeToFixed(mv, 1, "0.0")}%`, r.tone)}
+                            {toneBadge(
+                              `~${safeToFixed(mv, 1, "0.0")}%`,
+                              r.tone
+                            )}
                             <span className="text-[11px] text-zinc-500">
                               Range-based
                             </span>
@@ -1756,8 +2071,7 @@ export default function Home() {
 
                   <p className="mt-3 text-[11px] text-zinc-500 leading-relaxed">
                     This breakdown is a simple explanation based on model inputs.
-                    It helps interpret the output, but it does not prove
-                    causation.
+                    It helps interpret the output, but it does not prove causation.
                   </p>
                 </div>
 
@@ -1815,7 +2129,11 @@ export default function Home() {
                           Direction accuracy
                         </div>
                         <div className="mt-1 text-sm font-semibold">
-                          {safeToFixed((bt.metrics.direction_accuracy ?? 0) * 100, 1, "0.0")}
+                          {safeToFixed(
+                            (bt.metrics.direction_accuracy ?? 0) * 100,
+                            1,
+                            "0.0"
+                          )}
                           %
                         </div>
                       </div>
@@ -1854,6 +2172,84 @@ export default function Home() {
                     : `Model: RandomForest baseline (with SPY/QQQ context) • Trained on ${pred.data_points} candles`}
                 </div>
 
+                    {/* Recent predictions (last 10 runs) */}
+<div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
+  <div className="flex items-center justify-between">
+    <div className="text-xs text-zinc-500">Recent predictions (last 10)</div>
+    <button
+      type="button"
+      onClick={() => setPredLog([])}
+      className="text-[11px] text-zinc-400 hover:text-zinc-200"
+      title="Clear prediction history"
+    >
+      Clear
+    </button>
+  </div>
+
+  {predLog.length === 0 ? (
+    <div className="mt-3 text-sm text-zinc-500">
+      No predictions yet. Click Predict (or enable Auto).
+    </div>
+  ) : (
+    <div className="mt-3 rounded-lg border border-zinc-800 overflow-hidden">
+      <div className="max-h-64 overflow-auto">
+        <table className="w-full table-fixed">
+          <colgroup>
+            <col style={{ width: "34%" }} />
+            <col style={{ width: "22%" }} />
+            <col style={{ width: "22%" }} />
+            <col style={{ width: "22%" }} />
+          </colgroup>
+          <thead className="sticky top-0 z-10 bg-zinc-900/60 backdrop-blur">
+            <tr className="text-[11px] text-zinc-500">
+              <th className="text-left font-medium px-3 py-2">Time</th>
+              <th className="text-right font-medium px-3 py-2">Last</th>
+              <th className="text-right font-medium px-3 py-2">Pred</th>
+              <th className="text-right font-medium px-3 py-2">Δ%</th>
+            </tr>
+          </thead>
+          <tbody>
+            {predLog.map((r, idx) => {
+              const change =
+                r.last_close ? ((r.prediction - r.last_close) / r.last_close) * 100 : 0;
+
+              return (
+                <tr
+                  key={idx}
+                  className="border-t border-zinc-900/60 text-xs align-middle"
+                >
+                  <td className="px-3 py-2 text-zinc-400 whitespace-nowrap truncate">
+                    {new Date(r.at).toLocaleString()}
+                    <div className="text-[10px] text-zinc-600">{r.timeframe}</div>
+                  </td>
+                  <td className="px-3 py-2 text-right text-zinc-300 tabular-nums whitespace-nowrap">
+                    ${fmtMoney(r.last_close)}
+                  </td>
+                  <td className="px-3 py-2 text-right text-zinc-200 tabular-nums whitespace-nowrap">
+                    ${fmtMoney(r.prediction)}
+                  </td>
+                  <td
+                    className={`px-3 py-2 text-right font-medium tabular-nums whitespace-nowrap ${
+                      change >= 0 ? "text-emerald-200" : "text-red-200"
+                    }`}
+                  >
+                    {change >= 0 ? "+" : ""}
+                    {safeToFixed(change, 2, "0.00")}%
+                    <div className="text-[10px] text-zinc-600">
+                      conf {safeToFixed(r.confidence * 100, 0, "0")}%
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )}
+</div>
+
+
                 <details className="rounded-xl border border-zinc-800 bg-zinc-950 p-3">
                   <summary className="cursor-pointer text-sm text-zinc-200 select-none">
                     About this prediction
@@ -1880,7 +2276,7 @@ export default function Home() {
           </div>
         </section>
 
-        {/* News */}
+        {/* News (unchanged) */}
         <section className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
